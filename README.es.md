@@ -1,6 +1,6 @@
 # Posthorn
 
-[简体中文](README.zh-CN.md) · [English](README.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · Español
+[简体中文](README.md) · [English](README.en.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · Español
 
 Posthorn es una pasarela de correo transaccional para aplicaciones autohospedadas. Recibe mensajes mediante formularios HTTP, una API JSON o SMTP y los envía a través de proveedores como Resend, Postmark, Brevo, Mailgun o Amazon SES. Puedes configurar reglas de enrutamiento, proveedores de respaldo y cuotas desde un único servicio.
 

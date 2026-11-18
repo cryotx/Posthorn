@@ -6,7 +6,7 @@ dependencies.
 
 The endpoint path and required fields come from your config (the `path` and
 `required` list on each endpoint). These examples use the `/api/transactional`
-endpoint from the [README](../README.md), which requires `subject_line` and
+endpoint from the [English README](../README.en.md#api-mode-server-to-server), which requires `subject_line` and
 `message`.
 
 ## curl

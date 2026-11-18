@@ -1,6 +1,6 @@
 # Posthorn
 
-[简体中文](README.zh-CN.md) · [English](README.md) · [日本語](README.ja.md) · 한국어 · [Español](README.es.md)
+[简体中文](README.md) · [English](README.en.md) · [日本語](README.ja.md) · 한국어 · [Español](README.es.md)
 
 Posthorn은 직접 운영하는 애플리케이션의 트랜잭션 이메일을 한곳에서 발송하는 게이트웨이입니다. HTTP 양식, HTTP API, SMTP로 요청을 받아 Resend, Postmark, Mailgun, Amazon SES, SMTP 릴레이 등 설정한 발송 서비스로 전달합니다. 여러 서비스를 함께 사용하면 서비스에 장애가 발생하거나 발송 한도에 도달했을 때 다른 서비스로 발송을 시도할 수 있습니다.
 

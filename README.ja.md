@@ -1,6 +1,6 @@
 # Posthorn
 
-[简体中文](README.zh-CN.md) · [English](README.md) · 日本語 · [한국어](README.ko.md) · [Español](README.es.md)
+[简体中文](README.md) · [English](README.en.md) · 日本語 · [한국어](README.ko.md) · [Español](README.es.md)
 
 Posthorn は、セルフホストするアプリケーション向けのメール送信ゲートウェイです。Web フォーム、JSON API、SMTP を受け付け、Resend、Postmark、Mailgun、Amazon SES などの配信サービスへ中継します。配信サービスを複数登録して、ルーティングルールや障害時の切り替えを設定できます。
 
