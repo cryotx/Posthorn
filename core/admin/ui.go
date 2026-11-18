@@ -47,6 +47,7 @@ type pageData struct {
 	// Lang is resolved once, in render, from the request — handlers
 	// never set this field themselves.
 	Lang      uiLang
+	Languages []languageLink
 	CSRFToken string
 	Version   string
 	Now       time.Time
@@ -110,6 +111,10 @@ func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, da
 	data.Version = h.deps.Version
 	data.Now = h.now().UTC()
 	data.Lang = h.lang(w, r)
+	data.Languages = languageLinks(r)
+	data.Notice = localizedMessage(data.Lang, data.Notice)
+	data.Error = localizedMessage(data.Lang, data.Error)
+	w.Header().Set("Content-Language", string(data.Lang))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
 	if err := uiTemplates.ExecuteTemplate(w, name, data); err != nil && h.deps.Logger != nil {
@@ -119,6 +124,7 @@ func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, da
 
 func (h *Handler) pageLogin(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.deps.Auth.ValidSession(h.deps.Auth.sessionID(r)); ok {
+		h.lang(w, r)
 		http.Redirect(w, r, "/admin", http.StatusSeeOther)
 		return
 	}
@@ -127,7 +133,7 @@ func (h *Handler) pageLogin(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) doLogin(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		http.Redirect(w, r, "/admin/login?error=bad+request", http.StatusSeeOther)
+		http.Redirect(w, r, "/admin/login?error=flash.bad_request", http.StatusSeeOther)
 		return
 	}
 	token := r.PostFormValue("token")
@@ -139,9 +145,9 @@ func (h *Handler) doLogin(w http.ResponseWriter, r *http.Request) {
 			At: h.now(), Actor: storage.ActorAdmin, Action: storage.AuditAdminLoginFailed,
 			SourceIP: sourceIP(r),
 		})
-		msg := "invalid+token"
+		msg := "flash.invalid_token"
 		if err == ErrLockedOut {
-			msg = "too+many+attempts"
+			msg = "flash.too_many_attempts"
 		}
 		http.Redirect(w, r, "/admin/login?error="+msg, http.StatusSeeOther)
 		return
@@ -249,7 +255,7 @@ func (h *Handler) pageMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.render(w, r, "messages", pageData{
 			TitleKey: "label.messages", Nav: "messages", CSRFToken: csrfToken,
-			Error: "invalid filter",
+			Error: "flash.invalid_filter",
 		})
 		return
 	}
@@ -315,7 +321,7 @@ func (h *Handler) doAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		http.Redirect(w, r, "/admin?error=bad+request", http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?error=flash.bad_request", http.StatusSeeOther)
 		return
 	}
 	if err := checkCSRF(kind, csrfToken, r); err != nil {
@@ -352,10 +358,10 @@ func (h *Handler) doAction(w http.ResponseWriter, r *http.Request) {
 		err = errNotFound
 	}
 	if err != nil {
-		http.Redirect(w, r, back+"?error=action+failed", http.StatusSeeOther)
+		http.Redirect(w, r, back+"?error=flash.action_failed", http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, back+"?notice=done", http.StatusSeeOther)
+	http.Redirect(w, r, back+"?notice=flash.done", http.StatusSeeOther)
 }
 
 // doProjectKey renders the generated credential directly in the POST response.

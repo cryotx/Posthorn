@@ -10,7 +10,7 @@ Include the commit or tag of this fork that you tested.
 
 **Please do not open public GitHub issues for security vulnerabilities.**
 
-Use GitHub's [private vulnerability reporting](https://github.com/cryotx/posthorn/security/advisories/new) — the "Report a vulnerability" button under the Security tab. That creates a private channel between you and the maintainer.
+Use GitHub's [private vulnerability reporting](https://github.com/cryotx/Posthorn/security/advisories/new) — the "Report a vulnerability" button under the Security tab. That creates a private channel between you and the maintainer.
 
 If private reporting is unavailable, open a public issue asking for a private reporting channel. Omit vulnerability details and credentials.
 

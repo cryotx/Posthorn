@@ -48,8 +48,8 @@ FROM gcr.io/distroless/static:nonroot@sha256:963fa6c544fe5ce420f1f54fb88b6fb0147
 
 LABEL org.opencontainers.image.title="Posthorn" \
       org.opencontainers.image.description="The unified outbound mail layer for self-hosted projects" \
-      org.opencontainers.image.source="https://github.com/cryotx/posthorn" \
-      org.opencontainers.image.url="https://github.com/cryotx/posthorn" \
+      org.opencontainers.image.source="https://github.com/cryotx/Posthorn" \
+      org.opencontainers.image.url="https://github.com/cryotx/Posthorn" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=builder /out/posthorn /usr/local/bin/posthorn

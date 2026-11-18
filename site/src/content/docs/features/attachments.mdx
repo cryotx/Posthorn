@@ -56,6 +56,6 @@ Attachments are a structural `attachments` array — base64 data, never a templa
 
 ## Delivery
 
-All five mail transports carry attachments natively (Postmark/Resend/SES JSON fields, Mailgun multipart, outbound-SMTP `multipart/mixed`), and the [webhook transport's](/configuration/transports/webhook/) receivers are unaffected (attachments do not cross into webhook payloads in v2.0). The SMTP *listener* does not ingest attachments from relayed mail — [open an issue](https://github.com/cryotx/posthorn/issues) if you have an app that needs that.
+All five mail transports carry attachments natively (Postmark/Resend/SES JSON fields, Mailgun multipart, outbound-SMTP `multipart/mixed`), and the [webhook transport's](/configuration/transports/webhook/) receivers are unaffected (attachments do not cross into webhook payloads in v2.0). The SMTP *listener* does not ingest attachments from relayed mail — [open an issue](https://github.com/cryotx/Posthorn/issues) if you have an app that needs that.
 
 Mind your provider's own limits (Postmark 10MB total, Mailgun 25MB, SES 40MB raw): Posthorn enforces your configured budget, and the provider enforces theirs at send time.

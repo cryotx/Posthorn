@@ -36,7 +36,7 @@ export default defineConfig({
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/cryotx/posthorn',
+          href: 'https://github.com/cryotx/Posthorn',
         },
       ],
       customCss: ['./src/styles/custom.css'],

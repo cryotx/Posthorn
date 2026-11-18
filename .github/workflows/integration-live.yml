@@ -33,7 +33,7 @@ concurrency:
 jobs:
   live:
     # Never run on forks — they have neither the secrets nor the trust.
-    if: github.repository == 'cryotx/posthorn' && github.ref_name == github.event.repository.default_branch
+    if: github.repository == 'cryotx/Posthorn' && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     environment: live-providers # protect with a required reviewer in repo settings
     defaults:

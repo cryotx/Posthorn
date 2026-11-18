@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to file a bug. **For security issues, do not open a public issue** — use [private vulnerability reporting](https://github.com/cryotx/posthorn/security/advisories/new) instead. See [SECURITY.md](https://github.com/cryotx/posthorn/blob/main/SECURITY.md) for the disclosure process.
+        Thanks for taking the time to file a bug. **For security issues, do not open a public issue** — use [private vulnerability reporting](https://github.com/cryotx/Posthorn/security/advisories/new) instead. See [SECURITY.md](https://github.com/cryotx/Posthorn/blob/main/SECURITY.md) for the disclosure process.
 
   - type: textarea
     id: description

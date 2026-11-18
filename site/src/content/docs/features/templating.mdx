@@ -81,7 +81,7 @@ Fallback when empty:        {{if .company}}{{.company}}{{else}}(not given){{end}
 Conditional section:        {{if eq .plan "pro"}}Priority support applies.{{end}}
 ```
 
-There is **no custom function library**: `lower`, `upper`, `trim`, `uuid`, `now` and friends are not available, deliberately — Posthorn keeps its dependency surface minimal, and value transformation belongs in the app or page that submits the data. If a transform can't be expressed with the built-ins and can't move to the client side, that's worth [an issue](https://github.com/cryotx/posthorn/issues) with the concrete template you're trying to write.
+There is **no custom function library**: `lower`, `upper`, `trim`, `uuid`, `now` and friends are not available, deliberately — Posthorn keeps its dependency surface minimal, and value transformation belongs in the app or page that submits the data. If a transform can't be expressed with the built-ins and can't move to the client side, that's worth [an issue](https://github.com/cryotx/Posthorn/issues) with the concrete template you're trying to write.
 
 ## Variables available
 

@@ -11,20 +11,16 @@ package admin
 // operator running the gateway is not the owner of the mail passing
 // through it (FR146).
 //
-// Bilingual (English/Chinese), added 2026-09-13. Every {{t $.Lang "key"}}
-// call resolves through the catalog in i18n.go. Scope boundary, stated
-// once here rather than at each call site: UI CHROME is translated —
-// nav, headings, table columns, buttons, empty states, explanatory
-// copy. RAW CONTENT is not — provider/project names (operator-chosen),
-// message ids, timestamps, HTTP status/error-class tokens, and a
-// provider's own capability values (yes/no/unsupported) stay as-is.
-// They are either arbitrary (a name has no translation) or technical
-// vocabulary an operator reading this matrix already reads in English
-// throughout the rest of Posthorn's docs; translating them would invent
-// inconsistency, not remove it.
+// The translation catalog supplies navigation, labels, status messages,
+// and explanatory text. Provider names, IDs, protocol statuses, and
+// timestamps retain their original values.
 const uiHTML = `
-{{define "head"}}<!-- rendered inside the page templates below -->
-<title>Posthorn admin — {{t .Lang .TitleKey}}</title>
+{{define "head"}}<!doctype html>
+<html lang="{{.Lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{t .Lang "title.admin"}} — {{t .Lang .TitleKey}}</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -50,11 +46,13 @@ const uiHTML = `
           border-radius: 6px; transition: color .1s, background .1s; }
   nav a:hover { color: #fff; background: #22252c; }
   nav a.current { color: #fff; background: #262a33; box-shadow: inset 0 -2px 0 var(--accent); }
-  .top-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
-  .lang-switch { display: flex; gap: 2px; font-size: 12px; }
-  .lang-switch a { color: #8b93a3; text-decoration: none; padding: 3px 7px; border-radius: 4px; }
-  .lang-switch a.current { color: #fff; background: #2c303a; font-weight: 600; }
-  .lang-switch a:not(.current):hover { color: #d7dae1; }
+  .top-right { margin-left: auto; display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
+  .lang-switch { display: flex; flex-wrap: wrap; gap: 2px; font-size: 12px; }
+  .lang-switch a { color: var(--muted); text-decoration: none; padding: 3px 7px; border-radius: 4px; }
+  .lang-switch a.current { color: var(--accent-ink); background: var(--bg); font-weight: 600; }
+  header .lang-switch a { color: #aeb4c2; }
+  header .lang-switch a.current { color: #fff; background: #2c303a; }
+  .lang-switch a:not(.current):hover { text-decoration: underline; }
   main { padding: 24px; max-width: 1150px; margin: 0 auto; }
   h2 { font-size: 14px; margin: 28px 0 10px; font-weight: 700; letter-spacing: .01em;
        color: var(--text); text-transform: uppercase; opacity: .78; }
@@ -108,6 +106,8 @@ const uiHTML = `
   .login-wrap { display: flex; justify-content: center; padding-top: 10vh; }
   .login-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
                 box-shadow: var(--shadow); padding: 32px; width: 100%; max-width: 380px; }
+  .login-card .lang-switch { margin-top: 16px; }
+  .login-card input[type=password] { width: 100%; min-width: 0; }
   .login-card h2 { margin-top: 0; text-transform: none; font-size: 17px; opacity: 1; }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -122,6 +122,16 @@ const uiHTML = `
     .pill { background: #2a2c32; }
   }
 </style>
+</head>
+<body>
+{{end}}
+
+{{define "languages"}}
+{{if .Languages}}
+<nav class="lang-switch" aria-label="{{t .Lang "label.language"}}">
+  {{range .Languages}}<a href="{{.Href}}" hreflang="{{.Code}}" lang="{{.Code}}" {{if eq $.Lang .Code}}class="current" aria-current="true"{{end}}>{{.Label}}</a>{{end}}
+</nav>
+{{end}}
 {{end}}
 
 {{define "chrome"}}
@@ -135,10 +145,7 @@ const uiHTML = `
     <a href="/admin/audit" {{if eq .Nav "audit"}}class="current"{{end}}>{{t .Lang "nav.audit"}}</a>
   </nav>
   <div class="top-right">
-    <div class="lang-switch">
-      <a href="?lang=en" {{if eq .Lang "en"}}class="current"{{end}}>EN</a>
-      <a href="?lang=zh" {{if eq .Lang "zh"}}class="current"{{end}}>中文</a>
-    </div>
+    {{template "languages" .}}
     <form class="inline" method="post" action="/admin/logout">
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <button type="submit">{{t .Lang "nav.signout"}}</button>
@@ -154,6 +161,8 @@ const uiHTML = `
 
 {{define "foot"}}
 <footer>{{printf (t .Lang "footer.fmt") .Version (ts .Now)}}</footer>
+</body>
+</html>
 {{end}}
 
 {{define "login"}}
@@ -166,10 +175,7 @@ const uiHTML = `
     <p><button type="submit">{{t .Lang "label.signin"}}</button></p>
   </form>
   <p class="muted">{{t .Lang "login.hint"}}</p>
-  <p class="lang-switch" style="margin-top:16px">
-    <a href="?lang=en" {{if eq .Lang "en"}}class="current"{{end}}>EN</a> ·
-    <a href="?lang=zh" {{if eq .Lang "zh"}}class="current"{{end}}>中文</a>
-  </p>
+  {{template "languages" .}}
 </div></div>
 {{template "foot" .}}
 {{end}}
@@ -314,8 +320,8 @@ const uiHTML = `
 <label for="name">{{t .Lang "provider.name"}}</label>
 {{if .ProviderForm.Editing}}<input id="name" name="name" type="text" value="{{.ProviderForm.Name}}" readonly required>{{else}}<input id="name" name="name" type="text" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" required>{{end}}
 {{range .ProviderForm.Fields}}
-<label for="field-{{.Name}}">{{.Label}}</label>
-{{if .Secret}}<input id="field-{{.Name}}" type="password" name="{{.Name}}" autocomplete="new-password" {{if not $.ProviderForm.Editing}}required{{end}}>{{else if eq .Name "mailgun_region"}}<select id="field-{{.Name}}" name="{{.Name}}"><option value="us" {{if eq .Value "us"}}selected{{end}}>US / 美国</option><option value="eu" {{if eq .Value "eu"}}selected{{end}}>EU / 欧盟</option></select>{{else if eq .Name "implicit_tls"}}<select id="field-{{.Name}}" name="{{.Name}}"><option value="false" {{if eq .Value "false"}}selected{{end}}>STARTTLS (587)</option><option value="true" {{if eq .Value "true"}}selected{{end}}>TLS (465)</option></select>{{else}}<input id="field-{{.Name}}" type="text" name="{{.Name}}" value="{{.Value}}" required>{{end}}
+<label for="field-{{.Name}}">{{t $.Lang .LabelKey}}</label>
+{{if .Secret}}<input id="field-{{.Name}}" type="password" name="{{.Name}}" autocomplete="new-password" {{if not $.ProviderForm.Editing}}required{{end}}>{{else if eq .Name "mailgun_region"}}<select id="field-{{.Name}}" name="{{.Name}}"><option value="us" {{if eq .Value "us"}}selected{{end}}>{{t $.Lang "field.region_us"}}</option><option value="eu" {{if eq .Value "eu"}}selected{{end}}>{{t $.Lang "field.region_eu"}}</option></select>{{else if eq .Name "implicit_tls"}}<select id="field-{{.Name}}" name="{{.Name}}"><option value="false" {{if eq .Value "false"}}selected{{end}}>STARTTLS (587)</option><option value="true" {{if eq .Value "true"}}selected{{end}}>TLS (465)</option></select>{{else}}<input id="field-{{.Name}}" type="text" name="{{.Name}}" value="{{.Value}}" required>{{end}}
 {{end}}
 {{if .ProviderForm.Editing}}<p class="muted">{{t .Lang "provider.keep_secret"}}</p>{{end}}
 {{if eq .ProviderForm.Type "smtp"}}<p class="muted">{{t .Lang "provider.smtp_tls"}}</p>{{end}}

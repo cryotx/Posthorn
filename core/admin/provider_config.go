@@ -2,7 +2,6 @@ package admin
 
 import (
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -10,8 +9,8 @@ import (
 )
 
 type providerField struct {
-	Name, Label, Value string
-	Secret             bool
+	Name, LabelKey, Value string
+	Secret                bool
 }
 type providerForm struct {
 	Name, Type, DisplayType  string
@@ -23,32 +22,32 @@ type providerForm struct {
 // Only these fields are ever rendered or accepted. In particular, credentials
 // are password inputs with no value, even if a manager accidentally returns one.
 func providerFields(typ string) []providerField {
-	fields := []providerField{{Name: "from", Label: "Verified sender address / 已验证发件地址"}}
-	add := func(name, label string, secret bool) {
-		fields = append(fields, providerField{Name: name, Label: label, Secret: secret})
+	fields := []providerField{{Name: "from", LabelKey: "field.from"}}
+	add := func(name, labelKey string, secret bool) {
+		fields = append(fields, providerField{Name: name, LabelKey: labelKey, Secret: secret})
 	}
 	switch typ {
 	case "resend", "brevo", "postmark":
-		add("api_key", "API key / API 密钥", true)
+		add("api_key", "field.api_key", true)
 	case "mailgun":
-		add("domain", "Mailgun domain / 发信域名", false)
-		add("mailgun_region", "Mailgun region / 服务区域", false)
-		add("api_key", "API key / API 密钥", true)
+		add("domain", "field.domain", false)
+		add("mailgun_region", "field.mailgun_region", false)
+		add("api_key", "field.api_key", true)
 	case "ses":
-		add("region", "AWS region / 区域", false)
-		add("access_key_id", "AWS access key ID", true)
-		add("secret_access_key", "AWS secret access key", true)
+		add("region", "field.region", false)
+		add("access_key_id", "field.access_key_id", true)
+		add("secret_access_key", "field.secret_access_key", true)
 	case "cloudflare":
-		add("account_id", "Cloudflare account ID / 账户 ID", false)
-		add("api_token", "API token / API 令牌", true)
+		add("account_id", "field.account_id", false)
+		add("api_token", "field.api_token", true)
 	case "sendernet":
-		add("api_token", "API token / API 令牌", true)
+		add("api_token", "field.api_token", true)
 	case "smtp":
-		add("host", "SMTP host / 服务器地址", false)
-		add("port", "SMTP port / 端口", false)
-		add("username", "SMTP username / 用户名", true)
-		add("password", "SMTP password / 密码", true)
-		add("implicit_tls", "TLS connection / 加密连接方式", false)
+		add("host", "field.host", false)
+		add("port", "field.port", false)
+		add("username", "field.username", true)
+		add("password", "field.password", true)
+		add("implicit_tls", "field.implicit_tls", false)
 	default:
 		return nil
 	}
@@ -196,10 +195,10 @@ func (h *Handler) doProviderConfigure(w http.ResponseWriter, r *http.Request) {
 	}
 	err = h.audited(r, "provider.configuration_saved", name, nil, func() error { return h.deps.ProviderManager.Save(input) })
 	if err != nil {
-		http.Redirect(w, r, "/admin/providers/configure?error="+url.QueryEscape("保存失败，请检查配置名称、发件地址、凭据和额度。 / Save failed; check the fields."), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin/providers/configure?error=flash.provider_save_failed", http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/admin/providers?notice="+url.QueryEscape("服务商配置已保存 / Provider saved"), http.StatusSeeOther)
+	http.Redirect(w, r, "/admin/providers?notice=flash.provider_saved", http.StatusSeeOther)
 }
 
 func (h *Handler) doManagedProviderState(w http.ResponseWriter, r *http.Request) {
@@ -227,8 +226,8 @@ func (h *Handler) doManagedProviderState(w http.ResponseWriter, r *http.Request)
 		action = "provider.enabled"
 	}
 	if err := h.audited(r, action, name, nil, func() error { return h.deps.ProviderManager.SetEnabled(name, enabled) }); err != nil {
-		http.Redirect(w, r, "/admin/providers?error="+url.QueryEscape("无法更改服务商状态 / Unable to update provider"), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin/providers?error=flash.provider_update_failed", http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/admin/providers?notice="+url.QueryEscape("服务商状态已更新 / Provider state updated"), http.StatusSeeOther)
+	http.Redirect(w, r, "/admin/providers?notice=flash.provider_state_updated", http.StatusSeeOther)
 }

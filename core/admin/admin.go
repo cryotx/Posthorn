@@ -185,6 +185,7 @@ func (h *Handler) require(w http.ResponseWriter, r *http.Request) (authKind, str
 func (h *Handler) requirePage(w http.ResponseWriter, r *http.Request) (string, bool) {
 	kind, csrfToken := h.deps.Auth.authenticate(r)
 	if kind == authNone {
+		h.lang(w, r)
 		http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
 		return "", false
 	}

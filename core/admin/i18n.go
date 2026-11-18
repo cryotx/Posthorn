@@ -1,61 +1,90 @@
 package admin
 
 import (
+	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
-// Bilingual UI (English / Chinese), added 2026-09-13.
-//
-// The admin surface stays server-rendered with no JavaScript (see
-// ui.go's file comment for why), so the language switch is a plain
-// link, not a client-side toggle: `?lang=zh` sets a cookie and the next
-// render picks it up. No round trip is needed to switch — the SAME
-// response that handles `?lang=` renders in the new language, and the
-// cookie makes it stick for every request after.
-//
-// Resolution order, first match wins:
-//  1. `?lang=` on the current request (also written to a cookie)
-//  2. the `posthorn_admin_lang` cookie from a previous visit
-//  3. the browser's Accept-Language header (zh-* → Chinese)
-//  4. English
-//
-// The catalog is a flat map, not nested structs, so a missing key is a
-// one-line addition rather than a schema change. A key present in one
-// language and not the other falls back to English rather than
-// rendering blank — a half-translated page beats a broken one — and a
-// key missing from BOTH renders as `[key.name]`, which is deliberately
-// ugly: it must be impossible to mistake for real copy while testing.
+// The admin UI chooses a language from the query, its preference cookie,
+// or the highest-weight supported language in Accept-Language. English
+// is the default and supplies the fallback for missing translations.
 
 type uiLang string
 
 const (
 	langEN uiLang = "en"
 	langZH uiLang = "zh"
+	langJA uiLang = "ja"
+	langKO uiLang = "ko"
+	langES uiLang = "es"
 )
 
-// langCookie is the persisted preference. Not HttpOnly: it carries no
-// secret, and the whole point of a language cookie is that it is
-// harmless to read or forge — worst case someone sees the wrong
-// language, never a security boundary.
 const langCookieName = "posthorn_admin_lang"
 
-// resolveLang implements the priority order above. ok reports whether
-// the request explicitly chose a language via ?lang= (the caller uses
-// this to decide whether to (re)write the cookie).
-func resolveLang(r *http.Request) (lang uiLang, fromQuery bool) {
-	if q := r.URL.Query().Get("lang"); q == string(langEN) || q == string(langZH) {
-		return uiLang(q), true
+var uiLanguages = []struct {
+	Code  uiLang
+	Label string
+}{
+	{langZH, "简体中文"},
+	{langEN, "English"},
+	{langJA, "日本語"},
+	{langKO, "한국어"},
+	{langES, "Español"},
+}
+
+// resolveLang reports whether the request chose a language explicitly,
+// so the handler can persist it in a cookie.
+func resolveLang(r *http.Request) (uiLang, bool) {
+	if q := uiLang(r.URL.Query().Get("lang")); catalog[q] != nil {
+		return q, true
 	}
-	if c, err := r.Cookie(langCookieName); err == nil {
-		if c.Value == string(langEN) || c.Value == string(langZH) {
-			return uiLang(c.Value), false
+	if c, err := r.Cookie(langCookieName); err == nil && catalog[uiLang(c.Value)] != nil {
+		return uiLang(c.Value), false
+	}
+	preferred, bestWeight := langEN, 0.0
+	for _, entry := range strings.Split(strings.Join(r.Header.Values("Accept-Language"), ","), ",") {
+		tag, params, err := mime.ParseMediaType(entry)
+		if err != nil {
+			continue
+		}
+		base, _, _ := strings.Cut(tag, "-")
+		lang := uiLang(base)
+		if catalog[lang] == nil {
+			continue
+		}
+		weight := 1.0
+		if q, ok := params["q"]; ok {
+			weight, err = strconv.ParseFloat(q, 64)
+			if err != nil {
+				continue
+			}
+		}
+		if weight > bestWeight && weight <= 1 {
+			preferred, bestWeight = lang, weight
 		}
 	}
-	if strings.HasPrefix(strings.ToLower(r.Header.Get("Accept-Language")), "zh") {
-		return langZH, false
+	return preferred, false
+}
+
+type languageLink struct {
+	Code  uiLang
+	Label string
+	Href  string
+}
+
+func languageLinks(r *http.Request) []languageLink {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return nil
 	}
-	return langEN, false
+	query := r.URL.Query()
+	links := make([]languageLink, 0, len(uiLanguages))
+	for _, language := range uiLanguages {
+		query.Set("lang", string(language.Code))
+		links = append(links, languageLink{language.Code, language.Label, "?" + query.Encode()})
+	}
+	return links
 }
 
 // lang resolves the request's language and, if it came from an
@@ -87,12 +116,50 @@ func translate(lang uiLang, key string) string {
 	return "[" + key + "]" // deliberately ugly — see file comment
 }
 
-// catalog is the whole UI's strings, English and Chinese side by side
-// so a translation is never more than one screen away from the string
-// it translates. Keys are grouped by template; within a template, in
-// the order they appear.
+// localizedMessage translates a UI message while retaining literal text
+// supplied through existing notice and error query parameters.
+func localizedMessage(lang uiLang, message string) string {
+	if strings.HasPrefix(message, "flash.") && catalog[langEN][message] != "" {
+		return translate(lang, message)
+	}
+	return message
+}
+
+// Catalog keys are grouped by template.
 var catalog = map[uiLang]map[string]string{
+	langJA: japaneseCatalog,
+	langKO: koreanCatalog,
+	langES: spanishCatalog,
 	langEN: {
+		"label.language":               "Language",
+		"title.admin":                  "Posthorn admin",
+		"field.from":                   "Verified sender address",
+		"field.api_key":                "API key",
+		"field.domain":                 "Mailgun domain",
+		"field.mailgun_region":         "Mailgun region",
+		"field.region":                 "AWS region",
+		"field.access_key_id":          "AWS access key ID",
+		"field.secret_access_key":      "AWS secret access key",
+		"field.account_id":             "Cloudflare account ID",
+		"field.api_token":              "API token",
+		"field.host":                   "SMTP host",
+		"field.port":                   "SMTP port",
+		"field.username":               "SMTP username",
+		"field.password":               "SMTP password",
+		"field.implicit_tls":           "TLS connection",
+		"field.region_us":              "United States",
+		"field.region_eu":              "European Union",
+		"flash.bad_request":            "Invalid request.",
+		"flash.invalid_token":          "Invalid admin token.",
+		"flash.too_many_attempts":      "Too many sign-in attempts. Try again later.",
+		"flash.invalid_filter":         "Invalid filter.",
+		"flash.action_failed":          "Action failed.",
+		"flash.done":                   "Action completed.",
+		"flash.provider_save_failed":   "Unable to save the provider. Check its name, sender, credentials and limits.",
+		"flash.provider_saved":         "Provider saved.",
+		"flash.provider_update_failed": "Unable to update the provider.",
+		"flash.provider_state_updated": "Provider state updated.",
+
 		// --- chrome: nav, sign-out, language switch ---
 		"project.name":             "Project name",
 		"project.create":           "Create project and key",
@@ -234,7 +301,7 @@ var catalog = map[uiLang]map[string]string{
 		"provider.quota_hint":       "Limits count sends from this service only; 0 means unlimited. Check your provider’s plan limits. Counters reset on UTC calendar boundaries.",
 		"provider.single_recipient": "This provider supports one recipient per message.",
 		"provider.smtp_tls":         "SMTP always uses TLS. Select the connection type required by your provider.",
-		"provider.intro":            "Use a sender address verified with this provider. New providers start disabled. Enabled providers are tried in name order before QQ, using their configured sender. Permanent rejection does not trigger fallback.",
+		"provider.intro":            "Use a sender address verified with this provider. New providers start disabled. In failover routes, Posthorn tries enabled providers in name order before those in the configuration file. Each provider uses its own sender address. Permanent rejection does not trigger fallback.",
 		"hint.providers":            "Enable or disable configured providers here. Provider credentials are never shown.",
 		"hint.projects": "The key column shows a fingerprint. API keys cannot be recovered after creation. " +
 			"Configured projects may have multiple keys during a rotation.",
@@ -261,6 +328,35 @@ var catalog = map[uiLang]map[string]string{
 		"footer.fmt": "Posthorn %s · %s · recipients are masked and message bodies are never shown",
 	},
 	langZH: {
+		"label.language":               "语言",
+		"title.admin":                  "Posthorn 管理后台",
+		"field.from":                   "已验证的发件地址",
+		"field.api_key":                "API 密钥",
+		"field.domain":                 "Mailgun 发信域名",
+		"field.mailgun_region":         "Mailgun 服务区域",
+		"field.region":                 "AWS 区域",
+		"field.access_key_id":          "AWS 访问密钥 ID",
+		"field.secret_access_key":      "AWS 秘密访问密钥",
+		"field.account_id":             "Cloudflare 账户 ID",
+		"field.api_token":              "API 令牌",
+		"field.host":                   "SMTP 服务器地址",
+		"field.port":                   "SMTP 端口",
+		"field.username":               "SMTP 用户名",
+		"field.password":               "SMTP 密码",
+		"field.implicit_tls":           "TLS 连接方式",
+		"field.region_us":              "美国",
+		"field.region_eu":              "欧盟",
+		"flash.bad_request":            "请求无效。",
+		"flash.invalid_token":          "管理员令牌无效。",
+		"flash.too_many_attempts":      "登录尝试过多，请稍后再试。",
+		"flash.invalid_filter":         "筛选条件无效。",
+		"flash.action_failed":          "操作失败。",
+		"flash.done":                   "操作已完成。",
+		"flash.provider_save_failed":   "无法保存服务商。请检查名称、发件地址、凭据和配额。",
+		"flash.provider_saved":         "服务商已保存。",
+		"flash.provider_update_failed": "无法更新服务商。",
+		"flash.provider_state_updated": "服务商状态已更新。",
+
 		"project.name":             "项目名称",
 		"project.create":           "创建项目并生成密钥",
 		"project.create_hint":      "每个应用使用独立的项目名称。密钥仅显示一次。",
@@ -391,7 +487,7 @@ var catalog = map[uiLang]map[string]string{
 		"provider.quota_hint":       "仅统计本服务发送的邮件，0 表示不限。请核对服务商账号的实际额度；按 UTC 日历重置。",
 		"provider.single_recipient": "该服务商每封邮件只支持一个收件人。",
 		"provider.smtp_tls":         "SMTP 始终使用加密连接，请按服务商的要求选择连接方式。",
-		"provider.intro":            "请填写在该服务商验证过的发件地址。新服务商保存后默认停用。启用后按名称顺序优先使用已启用的新通道及其发件地址，QQ 通道排在最后。永久性拒绝不会自动切换备用通道。",
+		"provider.intro":            "请填写在该服务商验证过的发件地址。新服务商保存后默认停用。在故障转移路由中，系统按名称顺序优先尝试后台启用的服务商，之后再尝试配置文件中的服务商。每个服务商使用自己的发件地址。永久性拒绝不会自动切换备用通道。",
 		"hint.providers":            "可以在这里启用或停用已配置的服务商。服务商凭据不会显示。",
 		"hint.projects":             "密钥列显示的是指纹。密钥生成后无法再次查看；配置文件中的项目在轮换期间可能有多个密钥。",
 		"hint.suppressions": "移除一条抑制记录会被记入审计日志。退信或投诉类的抑制存在是为了保护服务商账号——" +

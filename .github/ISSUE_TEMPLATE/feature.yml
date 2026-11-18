@@ -9,8 +9,8 @@ body:
       value: |
         Thanks for the idea. Two things before you fill this out:
 
-        - **v1.0 is locked.** See [spec/01-project-brief.md §"MVP Scope > Out of scope"](https://github.com/cryotx/posthorn/blob/main/spec/01-project-brief.md) for what's deliberately deferred.
-        - **The roadmap is public.** Check [roadmap](https://github.com/cryotx/posthorn/blob/main/site/src/content/docs/roadmap.mdx) and the [open milestones](https://github.com/cryotx/posthorn/milestones) — your idea may already be tracked.
+        - **v1.0 is locked.** See [spec/01-project-brief.md §"MVP Scope > Out of scope"](https://github.com/cryotx/Posthorn/blob/main/spec/01-project-brief.md) for what's deliberately deferred.
+        - **The roadmap is public.** Check [roadmap](https://github.com/cryotx/Posthorn/blob/main/site/src/content/docs/roadmap.mdx) and the [open milestones](https://github.com/cryotx/Posthorn/milestones) — your idea may already be tracked.
 
         The clearer the problem statement, the faster this lands in the right milestone (or gets pushed back with a good reason).
 
@@ -64,7 +64,7 @@ body:
     id: scope
     attributes:
       label: Scope check
-      description: Where does this fit on the [roadmap](https://github.com/cryotx/posthorn/blob/main/site/src/content/docs/roadmap.mdx)?
+      description: Where does this fit on the [roadmap](https://github.com/cryotx/Posthorn/blob/main/site/src/content/docs/roadmap.mdx)?
       options:
         - "An existing FR/NFR is unclear or needs spec clarification (v1.0 patch)"
         - "v1.1 — API mode (API-key auth, JSON content type, idempotency, batch send)"

@@ -2,12 +2,16 @@
 
 <!-- Modified for the cryotx/posthorn distribution. -->
 
-[![CI](https://github.com/cryotx/posthorn/actions/workflows/ci.yml/badge.svg)](https://github.com/cryotx/posthorn/actions/workflows/ci.yml)
+[简体中文](README.zh-CN.md) · English · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md)
+
+[![CI](https://github.com/cryotx/Posthorn/actions/workflows/ci.yml/badge.svg)](https://github.com/cryotx/Posthorn/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-posthorn.dev-d4a300)](https://posthorn.dev)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![Go version](https://img.shields.io/badge/go-1.25%2B-00ADD8.svg)](https://go.dev)
 
-This edition is based on [craigmccaskill/posthorn](https://github.com/craigmccaskill/posthorn) and is distributed under the original Apache-2.0 license. It adds a bilingual admin dashboard, project API key management, and encrypted storage for provider credentials. The [Compose guide](deploy/compose/README.md) runs this edition from source. Links to posthorn.dev refer to the upstream project.
+This edition is based on [craigmccaskill/posthorn](https://github.com/craigmccaskill/posthorn) and is distributed under the original Apache-2.0 license. It adds a multilingual admin dashboard, project API key management, and encrypted storage for provider credentials. The [Compose guide](deploy/compose/README.md) runs this edition from source. Links to posthorn.dev refer to the upstream project.
+
+The admin dashboard supports Simplified Chinese, English, Japanese, Korean, and Spanish. Choose a language on the sign-in page or in the dashboard header.
 
 **The unified outbound mail layer for self-hosted projects.** One gateway between every app you self-host — or every project you run — and the transactional mail providers you've already picked. Three ingress shapes (HTTP form, HTTP API, SMTP), six transports (Postmark, Resend, Mailgun, AWS SES, outbound-SMTP relay, webhook), and a provider pool that fails over, splits by weight, routes by rule, and spends your free tier before your paid one. Single Go binary, single TOML config.
 
@@ -293,8 +297,8 @@ Full trajectory: [posthorn.dev/roadmap](https://posthorn.dev/roadmap/).
 Requires Go 1.25+.
 
 ```bash
-git clone https://github.com/cryotx/posthorn
-cd posthorn/core
+git clone https://github.com/cryotx/Posthorn
+cd Posthorn/core
 go build -o /tmp/posthorn ./cmd/posthorn
 /tmp/posthorn version
 ```

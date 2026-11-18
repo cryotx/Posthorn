@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const SRC = new URL('../../CHANGELOG.md', import.meta.url);
 const OUT = new URL('../src/content/docs/changelog.md', import.meta.url);
-const REPO_BLOB = 'https://github.com/cryotx/posthorn/blob/main/';
+const REPO_BLOB = 'https://github.com/cryotx/Posthorn/blob/main/';
 
 const frontmatter = `---
 title: Changelog

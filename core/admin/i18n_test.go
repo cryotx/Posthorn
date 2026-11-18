@@ -9,107 +9,60 @@ import (
 	"testing"
 )
 
-// --- catalog completeness ------------------------------------------------
+func TestCatalog_CoversEveryAdminLabel(t *testing.T) {
+	keyUsage := regexp.MustCompile(`t \$?\.Lang "([^"]+)"`)
+	titleKey := regexp.MustCompile(`TitleKey:\s*"([^"]+)"`)
+	fieldKey := regexp.MustCompile(`"(field\.[a-z_]+)"`)
+	flashKey := regexp.MustCompile(`\b(flash\.[a-z_]+)\b`)
 
-// keyUsageRE extracts every catalog key referenced from html.go, in
-// either `{{t .Lang "key"}}` or `{{t $.Lang "key"}}` form (the two forms
-// templates need depending on whether "." is already the page root or
-// has been shadowed by a {{range}}).
-var keyUsageRE = regexp.MustCompile(`t \$?\.Lang "([^"]+)"`)
-
-// titleKeyRE catches the OTHER way a key reaches a template: ui.go sets
-// pageData.TitleKey to a literal string, and html.go's <title> resolves
-// it dynamically via {{t .Lang .TitleKey}} — a key name that is itself
-// a template variable, not a literal, so keyUsageRE cannot see it.
-var titleKeyRE = regexp.MustCompile(`TitleKey:\s*"([^"]+)"`)
-
-// usedKeys returns every catalog key reachable from the templates,
-// combining both discovery methods above. Both orphan and coverage
-// checks call this so neither drifts from the other.
-func usedKeys(t *testing.T) map[string]bool {
-	t.Helper()
-	used := map[string]bool{}
-	for _, m := range keyUsageRE.FindAllStringSubmatch(uiHTML, -1) {
-		used[m[1]] = true
-	}
-	uiGoSrc, err := os.ReadFile("ui.go")
-	if err != nil {
-		t.Fatalf("read ui.go: %v", err)
-	}
-	for _, m := range titleKeyRE.FindAllStringSubmatch(string(uiGoSrc), -1) {
-		used[m[1]] = true
-	}
-	return used
-}
-
-// TestCatalog_EveryUsedKeyExistsInBothLanguages is the test that matters
-// most for a hand-written table this size: every key the templates
-// actually call must resolve in EN and in ZH. Without this, a typo in
-// either the template or the catalog falls back to English (or to the
-// deliberately-ugly "[key]") silently — this test turns that into a
-// build-time-adjacent failure instead of something only noticed by
-// eyeballing a rendered page in the other language.
-func TestCatalog_EveryUsedKeyExistsInBothLanguages(t *testing.T) {
-	used := usedKeys(t)
-	if len(used) < 50 {
-		t.Fatalf("only found %d key usages; the extraction regexes are probably broken", len(used))
-	}
-	for key := range used {
-		if _, ok := catalog[langEN][key]; !ok {
-			t.Errorf("template uses %q, missing from the English catalog", key)
-		}
-		if _, ok := catalog[langZH][key]; !ok {
-			t.Errorf("template uses %q, missing from the Chinese catalog", key)
+	used := make(map[string]bool)
+	collect := func(src string, pattern *regexp.Regexp) {
+		for _, match := range pattern.FindAllStringSubmatch(src, -1) {
+			used[match[1]] = true
 		}
 	}
-	t.Logf("checked %d distinct translation keys", len(used))
-}
+	collect(uiHTML, keyUsage)
+	for _, name := range []string{"ui.go", "provider_config.go"} {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		collect(string(src), titleKey)
+		collect(string(src), fieldKey)
+		collect(string(src), flashKey)
+	}
 
-// TestCatalog_NoOrphanedKeys is the mirror check: a key sitting in the
-// catalog that no template references is either a leftover from a
-// rename (silently stale) or evidence the extraction regex missed a
-// real usage (which would make the test above pass falsely). Catalog
-// keys not meant to be template-referenced directly (there are none
-// today) would need an allowlist here if that ever changes.
-func TestCatalog_NoOrphanedKeys(t *testing.T) {
-	used := usedKeys(t)
-	for key := range catalog[langEN] {
-		if !used[key] {
-			t.Errorf("catalog key %q (en) is not referenced by any template", key)
-		}
+	if len(catalog) != len(uiLanguages) {
+		t.Errorf("language picker has %d entries for %d catalogs", len(uiLanguages), len(catalog))
 	}
-	for key := range catalog[langZH] {
-		if !used[key] {
-			t.Errorf("catalog key %q (zh) is not referenced by any template", key)
+	for _, option := range uiLanguages {
+		stringsByKey := catalog[option.Code]
+		for key := range used {
+			if strings.TrimSpace(stringsByKey[key]) == "" {
+				t.Errorf("%s: empty or missing translation for %q", option.Code, key)
+			}
 		}
-	}
-}
-
-// Every English and Chinese entry for the SAME key should exist —
-// asymmetric coverage (a key present in one language's map but absent
-// from the other) is exactly the case that silently triggers the
-// English fallback the file comment warns about.
-func TestCatalog_LanguagesHaveMatchingKeySets(t *testing.T) {
-	for key := range catalog[langEN] {
-		if _, ok := catalog[langZH][key]; !ok {
-			t.Errorf("key %q has an English entry but no Chinese one", key)
-		}
-	}
-	for key := range catalog[langZH] {
-		if _, ok := catalog[langEN][key]; !ok {
-			t.Errorf("key %q has a Chinese entry but no English one", key)
+		for key := range stringsByKey {
+			if !used[key] {
+				t.Errorf("%s: unused translation key %q", option.Code, key)
+			}
 		}
 	}
 }
 
 // --- t() lookup behaviour -------------------------------------------------
 
-func TestT_ResolvesBothLanguages(t *testing.T) {
-	if got := translate(langEN, "nav.dashboard"); got != "Dashboard" {
-		t.Errorf("t(en, nav.dashboard) = %q", got)
-	}
-	if got := translate(langZH, "nav.dashboard"); got != "仪表盘" {
-		t.Errorf("t(zh, nav.dashboard) = %q", got)
+func TestT_ResolvesEveryLanguage(t *testing.T) {
+	for lang, want := range map[uiLang]string{
+		langEN: "Dashboard",
+		langZH: "仪表盘",
+		langJA: "ダッシュボード",
+		langKO: "대시보드",
+		langES: "Panel",
+	} {
+		if got := translate(lang, "nav.dashboard"); got != want {
+			t.Errorf("translate(%s, nav.dashboard) = %q, want %q", lang, got, want)
+		}
 	}
 }
 
@@ -156,6 +109,12 @@ func TestResolveLang_AcceptLanguageSniffing(t *testing.T) {
 		{"zh", langZH},
 		{"ZH-tw", langZH}, // case-insensitive
 		{"en-US,en;q=0.9", langEN},
+		{"ja-JP", langJA},
+		{"ko-KR", langKO},
+		{"es-MX", langES},
+		{"fr-CA, es-ES;q=0.7, ja;q=0.9", langJA},
+		{"zh;q=0, en;q=0.1, ko;q=0.8", langKO},
+		{"ja;q=2, es;q=0.4", langES},
 		{"", langEN},
 		{"fr-FR", langEN}, // unsupported language falls back to English, not blank
 	} {
@@ -228,34 +187,44 @@ func TestAdmin_LanguageSwitchEndToEnd(t *testing.T) {
 	}
 }
 
-// The two toggle links must exist and correctly mark whichever
-// language is currently active — an operator needs to see which one
-// they're on, not just have two identical-looking links.
-func TestAdmin_LanguageToggleLinksMarkCurrentLanguage(t *testing.T) {
+func TestAdmin_LanguageToggleKeepsQueryAndMarksCurrentLanguage(t *testing.T) {
 	x := newHarness(t)
 	c, _ := x.login(t)
 
-	r := httptest.NewRequest(http.MethodGet, "/admin?lang=zh", nil)
+	r := httptest.NewRequest(http.MethodGet, "/admin/messages?lang=ko&project=demo", nil)
 	r.AddCookie(c)
 	rec := httptest.NewRecorder()
 	x.h.ServeHTTP(rec, r)
 	body := rec.Body.String()
 
-	if !strings.Contains(body, `href="?lang=en"`) || !strings.Contains(body, `href="?lang=zh"`) {
-		t.Fatal("both language toggle links must be present regardless of current language")
+	if got := rec.Header().Get("Content-Language"); got != "ko" {
+		t.Errorf("Content-Language = %q, want ko", got)
 	}
-	// The zh link should carry class="current" somewhere near it; a
-	// crude but sufficient check given both plain strings appear once
-	// each in the chrome.
-	zhIdx := strings.Index(body, `href="?lang=zh"`)
-	enIdx := strings.Index(body, `href="?lang=en"`)
-	zhSnippet := body[zhIdx : zhIdx+40]
-	enSnippet := body[enIdx : enIdx+40]
-	if !strings.Contains(zhSnippet, "current") {
-		t.Errorf("zh toggle not marked current: %q", zhSnippet)
+	if !strings.Contains(body, `<html lang="ko">`) {
+		t.Error("HTML document has no Korean language declaration")
 	}
-	if strings.Contains(enSnippet, "current") {
-		t.Errorf("en toggle incorrectly marked current: %q", enSnippet)
+	for _, option := range uiLanguages {
+		href := `href="?lang=` + string(option.Code) + `&amp;project=demo"`
+		start := strings.Index(body, href)
+		if start < 0 {
+			t.Fatalf("language toggle missing or dropped the project filter: %s", option.Code)
+		}
+		link := strings.SplitN(body[start:], ">", 2)[0]
+		if strings.Contains(link, `aria-current="true"`) != (option.Code == langKO) {
+			t.Errorf("incorrect selection indicator for %s: %s", option.Code, link)
+		}
+	}
+}
+
+func TestAdmin_LoginMessagesUseSelectedLanguage(t *testing.T) {
+	x := newHarness(t)
+	for _, option := range uiLanguages {
+		r := httptest.NewRequest(http.MethodGet, "/admin/login?error=flash.invalid_token&lang="+string(option.Code), nil)
+		rec := httptest.NewRecorder()
+		x.h.ServeHTTP(rec, r)
+		if !strings.Contains(rec.Body.String(), translate(option.Code, "flash.invalid_token")) {
+			t.Errorf("login error was not translated for %s", option.Code)
+		}
 	}
 }
 
