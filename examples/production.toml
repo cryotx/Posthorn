@@ -1,0 +1,183 @@
+# Posthorn v1.0 — production reference configuration.
+#
+# Every secret in this file is an env placeholder — written
+# dollar-brace-env-dot-NAME. That is not
+# decoration: a config file gets committed, copied into a ticket, and
+# pasted into an issue, and a key that only ever exists in the process
+# environment survives all three. Posthorn refuses to start if any
+# placeholder is unset, so a missing variable is a startup failure
+# rather than a provider rejecting mail an hour later.
+#
+# One consequence worth knowing: placeholders are resolved BEFORE the
+# TOML is parsed, so one inside a comment still has to resolve. Comment
+# out the variable too, or drop the line entirely.
+#
+# The secrets this file expects:
+#
+#   POSTMARK_TOKEN          Postmark server token
+#   RESEND_API_KEY          Resend API key
+#   BREVO_API_KEY           Brevo API key (the `api-key` header value)
+#   ACME_API_KEY            project API key for the "acme" project
+#   ACME_API_KEY_NEXT       the incoming key during a rotation (optional)
+#   ACME_SMTP_PASSWORD      project SMTP AUTH password
+#   ACME_WEBHOOK_SECRET     signs delivery events sent to acme
+#   LIFECYCLE_BASIC_PASSWORD  protects the inbound webhook endpoint
+#   RESEND_WEBHOOK_SECRET   Resend's Standard Webhooks signing secret
+#
+# The admin surface's credential is deliberately NOT in this file:
+# POSTHORN_ADMIN_TOKEN is read from the environment only, so it cannot
+# be set by a config edit and cannot leak with the config.
+
+# --- storage -----------------------------------------------------------
+#
+# Required for: the retry queue, delivery events, project usage, the
+# admin surface and its audit log. The path lives on the mounted volume,
+# not in the container's writable layer.
+
+[storage]
+path = "/data/posthorn.db"
+retention = "720h"   # 30 days; Go duration units, so hours not days
+max_size = "1GB"
+
+# --- security ----------------------------------------------------------
+
+[security]
+# Default. Posthorn refuses to call loopback, private or link-local
+# addresses from a webhook_url or a quota URL. Set to true ONLY if your
+# event receiver really is on this host or your LAN — it never unblocks
+# link-local (169.254.0.0/16), which is where cloud metadata lives.
+allow_private_webhook_targets = false
+
+# --- provider pool -----------------------------------------------------
+#
+# One credential set per upstream, referenced by name. Sharing a pool
+# entry between endpoints shares its circuit breaker too, so an outage
+# noticed on one endpoint is already known to the others.
+
+[[providers]]
+name = "postmark-prod"
+type = "postmark"
+cost_per_1000 = "1.25"
+[providers.settings]
+api_key = "${env.POSTMARK_TOKEN}"
+
+[[providers]]
+name = "resend-backup"
+type = "resend"
+cost_per_1000 = "1.00"
+[providers.settings]
+api_key = "${env.RESEND_API_KEY}"
+
+[[providers]]
+name = "brevo-bulk"
+type = "brevo"
+cost_per_1000 = "0"
+# Brevo's free tier: bounded so Posthorn fails over rather than being
+# rejected at the provider. The counters are Posthorn's own, in UTC.
+[providers.quota]
+daily_limit = 300
+[providers.settings]
+api_key = "${env.BREVO_API_KEY}"
+
+# --- projects ----------------------------------------------------------
+
+[[projects]]
+name = "acme"
+
+# During a rotation, add the incoming key to api_keys:
+#
+#     api_keys = ["<placeholder for ACME_API_KEY_NEXT>"]
+#
+# Both keys work until you remove the old one, so callers migrate at
+# their own pace with no downtime window. `posthorn doctor` warns while
+# an overlap is open.
+api_key = "${env.ACME_API_KEY}"
+
+# The anti-spoofing control, and the reason projects exist. There is no
+# allow-all: a project that may send as any domain can impersonate every
+# other project on this gateway.
+allowed_from_domains = ["acme.example.com"]
+default_from = "noreply@acme.example.com"
+
+# Bounds this tenant's own volume. Separate from provider quota, which
+# bounds your upstream ACCOUNT — conflating them makes "who ran out"
+# unanswerable.
+daily_limit = 5000
+monthly_limit = 100000
+
+# Delivery events for this project's messages, signed with the secret.
+webhook_url = "https://events.acme.example.com/posthorn"
+webhook_secret = "${env.ACME_WEBHOOK_SECRET}"
+
+# Lets this project's apps submit over SMTP with the same identity and
+# the same sender policy as the HTTP key.
+smtp_username = "acme"
+smtp_password = "${env.ACME_SMTP_PASSWORD}"
+
+# --- endpoints ---------------------------------------------------------
+
+[[endpoints]]
+path = "/api/send"
+# api mode: server-to-server JSON callers with Authorization: Bearer.
+# Browser defenses (honeypot, Origin) do not apply and are rejected at
+# parse time here, so nobody configures one believing it is active.
+auth = "api-key"
+to = ["ops@acme.example.com"]
+from = "noreply@acme.example.com"
+subject = "{{.subject}}"
+body = "{{.message}}"
+mail_kind = "notification"
+
+[endpoints.transport]
+providers = ["postmark-prod", "resend-backup"]
+strategy = "failover"
+
+# Bulk mail goes to the free tier first and falls back when it runs out.
+[[endpoints.transport.rules]]
+match_kind = ["marketing"]
+providers = ["brevo-bulk", "resend-backup"]
+strategy = "free_first"
+
+[endpoints.rate_limit]
+count = 120
+interval = "1m"
+
+# --- inbound delivery events -------------------------------------------
+#
+# Basic auth is mandatory and fail-closed. Per-provider blocks add what
+# each provider actually publishes — Resend signs its payloads, Postmark
+# and Brevo do not, and configuring a signing_secret for one that does
+# not sign is a startup error rather than a setting that quietly does
+# nothing.
+
+[lifecycle]
+basic_auth_username = "posthorn"
+basic_auth_password = "${env.LIFECYCLE_BASIC_PASSWORD}"
+
+[lifecycle.providers.resend]
+signing_secret = "${env.RESEND_WEBHOOK_SECRET}"
+
+[lifecycle.providers.postmark]
+# Postmark publishes no payload signature. Its documented controls are
+# basic auth on the URL (above) and its published egress addresses.
+allowed_ips = [
+  "3.134.147.250",
+  "50.31.156.6",
+  "50.31.156.77",
+  "18.217.206.57",
+]
+# Uncomment if a reverse proxy sits in front, or the source check reads
+# the proxy's address instead of the provider's.
+# trusted_proxies = ["172.16.0.0/12"]
+
+[lifecycle.providers.brevo]
+# Brevo publishes no payload signature either. Its webhook ranges are in
+# its help centre; copy the current list here rather than trusting a
+# value hard-coded in a release.
+# allowed_ips = ["1.179.112.0/20", "172.246.240.0/20"]
+
+# --- logging -----------------------------------------------------------
+
+[logging]
+level = "info"
+format = "json"

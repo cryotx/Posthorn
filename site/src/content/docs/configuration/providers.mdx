@@ -1,0 +1,124 @@
+---
+title: Provider pool
+description: Define your mail providers once as named pool entries, then reference them by name from endpoints and the SMTP listener.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Through v2.0, every endpoint carried its own transport block — which meant the same API key was copy-pasted into every `[endpoints.transport.settings]` in the file, and each endpoint discovered a provider outage independently.
+
+The **provider pool** fixes both. Declare each upstream once as a top-level `[[providers]]` block, then reference it by name:
+
+```toml
+[[providers]]
+name = "postmark-prod"
+type = "postmark"
+[providers.settings]
+api_key = "${env.POSTMARK_API_KEY}"
+
+[[providers]]
+name = "ses-backup"
+type = "ses"
+[providers.settings]
+region            = "us-east-1"
+access_key_id     = "${env.AWS_ACCESS_KEY_ID}"
+secret_access_key = "${env.AWS_SECRET_ACCESS_KEY}"
+
+[[endpoints]]
+path = "/api/contact"
+# ... to, from, subject, body ...
+
+[endpoints.transport]
+providers = ["postmark-prod", "ses-backup"]
+```
+
+That endpoint now sends through Postmark and falls back to SES when Postmark is having a bad day. See [Routing](/features/routing/) for the strategies and rules that decide *which* provider gets each message.
+
+<Aside type="note">
+Nothing here is required. An endpoint that keeps the v2.0 inline shape — `type` plus `settings` — behaves exactly as it did before, down to the metric labels and log fields. You can migrate one endpoint at a time, or never.
+</Aside>
+
+## The pool is shared
+
+A pool entry is built **once per process**. Two endpoints naming `postmark-prod` get the same client and, more importantly, the same [circuit breaker](#circuit-breakers) — so an outage noticed by `/api/contact` is already known to `/api/alerts`. Health is a property of the provider, not of whichever endpoint happened to notice.
+
+## Fields
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | The key endpoints reference. Must be unique. Appears in logs and metric labels, so keep it operator-meaningful (`postmark-prod`, not `p1`). |
+| `type` | yes | Any registered [transport](/configuration/transports/): `postmark`, `resend`, `mailgun`, `ses`, `smtp`, `webhook`. |
+| `settings` | yes | The transport's own settings, validated by that transport exactly as in an inline block. |
+| `weight` | no | Relative share under `strategy = "weighted"`. Defaults to 1; ignored by the other strategies. |
+| `circuit_breaker` | no | Per-provider health thresholds. See below. |
+
+## Circuit breakers
+
+Each provider gets a breaker. A provider that keeps failing is taken out of rotation for a cooldown, so a gateway with a dead upstream doesn't rediscover the same outage — and pay the same timeout — on every single submission.
+
+```toml
+[[providers]]
+name = "postmark-prod"
+type = "postmark"
+[providers.settings]
+api_key = "${env.POSTMARK_API_KEY}"
+
+[providers.circuit_breaker]
+failure_threshold = 5      # consecutive health-class failures that open it
+cooldown          = "30s"  # how long it stays out of rotation
+half_open_probes  = 1      # probes admitted when the cooldown expires
+```
+
+The states:
+
+- **closed** — normal. Sends go through.
+- **open** — `failure_threshold` consecutive health-class failures have happened. The provider is skipped entirely for `cooldown`.
+- **half-open** — the cooldown expired. `half_open_probes` sends are admitted. One success closes the circuit; one failure re-opens it for a fresh cooldown.
+
+Defaults are `5` / `30s` / `1`. Set `disabled = true` to turn a provider's breaker off completely — it will then never be skipped, however it is behaving.
+
+### Only health-class failures count
+
+A transient network error or a 429 says *this provider, right now*. Those move the breaker.
+
+A terminal 4xx — unverified `From` domain, malformed address, payload over the provider's cap — says *this message*. Those never count. If they did, one endpoint with a bad `From` domain would take every provider in your pool out of rotation, one submission at a time.
+
+<Aside type="caution">
+This is also why a **revoked API key does not fail over**. A 401 is terminal, so the send returns an error naming that provider instead of quietly draining onto your backup for weeks. That is deliberate: a revoked key is an operator problem that should be loud.
+</Aside>
+
+## Every provider must be used
+
+A pool entry that no endpoint and no `[smtp_listener]` references is a config error:
+
+```
+config: providers: [ses-backup] defined but referenced by no endpoint or
+smtp_listener — a provider nobody routes to is dead config (usually a
+half-applied rename)
+```
+
+This catches the common failure where a rename is applied to the `[[providers]]` block but not to the `providers = [...]` list, and the failover you thought you configured silently never fires.
+
+## Watching a pool
+
+`/healthz` reports every provider's circuit state:
+
+```json
+{"status":"ok","storage":"ok",
+ "providers":{"postmark-prod":"closed","ses-backup":"open"}}
+```
+
+The status code stays **200** even with every circuit open. `/healthz` is a liveness probe, and restarting the process does not fix an upstream outage — it just drops the mail the [retry queue](/features/storage/) is holding. Alert on the metric instead:
+
+```
+posthorn_provider_circuit_state{provider="postmark-prod"}   # 0 closed, 1 half-open, 2 open
+posthorn_provider_attempts_total{provider,outcome}
+posthorn_provider_skipped_total{provider}
+posthorn_provider_latency_seconds{provider}
+```
+
+Every provider gets its `circuit_state` series published at startup, so an absent series means "Posthorn isn't running", not "everything is fine".
+
+## Full example
+
+A complete annotated config — pool, weighted split, routing rules, SMTP listener and storage — ships in the repo at [`examples/multi-provider.toml`](https://github.com/cryotx/posthorn/blob/main/examples/multi-provider.toml).

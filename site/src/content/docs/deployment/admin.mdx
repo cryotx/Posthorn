@@ -1,0 +1,157 @@
+---
+title: Admin surface
+description: The operator dashboard, its JSON API, the audit log, and why it is off by default.
+---
+
+Posthorn v1.0 ships a small operator surface at `/admin`: a dashboard, a
+JSON API behind the same credential, and four narrow incident controls.
+
+It is **off unless you enable it**. Unset `POSTHORN_ADMIN_TOKEN` and the
+routes are not mounted at all — "no token configured" never degrades
+into "no authentication required".
+
+## Enabling it
+
+```bash
+POSTHORN_ADMIN_TOKEN="$(openssl rand -hex 32)" posthorn serve --config /etc/posthorn/config.toml
+```
+
+Three rules the surface enforces at startup:
+
+- **The token comes from the environment only.** Config cannot set it,
+  so it does not end up in the file you paste into an issue.
+- **It must be at least 24 characters.** This credential can read every
+  project's delivery history and take providers out of rotation.
+- **It must not be a project credential.** Startup *refuses* if the
+  admin token matches any project's API key or SMTP password. Sharing
+  one would mean a tenant's application key could read every tenant's
+  data.
+
+It also requires a `[storage]` block: the surface reads the submission
+log and writes an audit row for every action, and can do neither
+without one.
+
+## Do not expose it
+
+Posthorn binds to `127.0.0.1` in the reference deployment and does not
+terminate TLS. Reach the admin surface over an SSH tunnel, or behind a
+reverse proxy that authenticates in front of it:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 you@your-host
+# then open http://127.0.0.1:8080/admin
+```
+
+## Signing in
+
+The login form exchanges the token for a **session cookie**. The token
+itself never reaches the page and is never put in `localStorage`.
+
+| Property | Value | Why |
+|---|---|---|
+| `HttpOnly` | yes | Script cannot read the session, so an XSS in the UI cannot exfiltrate it |
+| `SameSite` | `Strict` | Every admin action is sensitive; none should work from a link in someone else's page |
+| `Secure` + `__Host-` prefix | when Posthorn terminates TLS | Browsers refuse a `__Host-` cookie that is not Secure, host-only and `path=/` |
+| Lifetime | 8 hours idle | — |
+
+The session id is not derived from the token, so a stolen cookie cannot
+be turned back into the credential. Login failures are throttled per
+source address — and the *correct* token is refused while a source is
+locked out, because otherwise the limit only slows down the last guess.
+
+State-changing requests from a session require a CSRF token. Requests
+authenticated with `Authorization: Bearer` do not: CSRF exists because
+browsers attach cookies automatically, and nothing attaches an
+`Authorization` header automatically.
+
+## What it shows
+
+Dashboard, Providers, Projects, Messages and Audit pages, plus the same
+data as JSON under `/admin/api/`.
+
+Two things it deliberately does **not** show:
+
+- **Message bodies.** Nowhere, in any view. The operator running the
+  gateway is not the owner of the mail passing through it.
+- **Full recipient addresses.** They are masked to `u***@example.com`.
+  An admin surface that lists every recipient is a harvestable directory
+  of every user of every tenant.
+
+Credentials are not shown either, and not because they are masked on the
+way out: **Posthorn does not store them**. Only digests are retained. The
+Projects page shows a short *fingerprint* of the key digest — enough to
+see that a key was rotated and that two projects hold different keys,
+never enough to reconstruct one.
+
+## What it can do
+
+Four controls, each audited:
+
+| Action | Effect |
+|---|---|
+| Disable / enable a provider | Takes it out of rotation immediately; the route continues to the next candidate |
+| Reset a circuit breaker | Closes an open breaker when you know the upstream is healthy again |
+| Suspend / restore a project | Stops that project's API key *and* its SMTP identity at the same instant |
+| Retry a dead letter | Puts a failed message back on the retry queue |
+| Remove a suppression | Unsuppresses an address you know is good |
+
+### Disables can only subtract
+
+An override **disables**; clearing one restores whatever the config file
+says. It can never enable a provider the config does not define, or a
+project the config disabled. The config file stays the source of truth
+for what is permitted, and this is a kill switch you can reach
+mid-incident without an edit, a restart and a deploy.
+
+Disables persist across restarts. A provider you turned off at 3am is
+still off when the process comes back.
+
+### Retrying a dead letter can fail, loudly
+
+An endpoint with `log_failed_submissions = false` records metadata only.
+Replaying such a row would deliver an **empty message** to a real
+recipient, so Posthorn refuses and says why. The content is gone and
+cannot be reconstructed.
+
+## The audit log
+
+Every privileged action writes a row to the audit log in SQLite, and the
+row is written **before** the action takes effect. If it cannot be
+written, the action does not happen — a crash between the two leaves a
+recorded action that did not occur, which you can check and correct;
+the reverse leaves a change nobody can trace.
+
+Audit rows carry no credentials — the table has no column for one — and
+the suppression-removal row records the *masked* address, since the
+audit log is read far more often than the suppression list.
+
+**Audit rows are exempt from retention pruning.** A trail that ages out
+is a trail an attacker only has to outwait.
+
+Failed logins are recorded too, with their source address.
+
+## Key rotation
+
+There is deliberately no endpoint that mints an API key: that would
+grant sending rights without a config change anybody reviews. Rotation
+is a config edit with an overlap, and no downtime:
+
+1. Add the new key to the project's `api_keys`, restart. Both keys work.
+2. Move callers to the new key at their own pace.
+3. Promote the new key to `api_key`, remove the old entry, restart.
+
+The Projects page shows **"2 keys live"** while an overlap is open, and
+`posthorn doctor` warns about it — an overlap left open forever is an
+old credential nobody remembered to remove.
+
+Posthorn notices at startup that a project's key set changed and writes
+the audit row for it, comparing a digest of digests: enough to confirm
+the change, never enough to reconstruct a key.
+
+## The UI has no JavaScript
+
+Server-rendered HTML, no external assets, `default-src 'none'`. There is
+no script to inject into, every value goes through contextual escaping,
+and the `HttpOnly` cookie means something because the page never needs
+to read it. It also works fine over an SSH tunnel, which is how it is
+meant to be reached.

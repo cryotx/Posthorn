@@ -1,0 +1,33 @@
+[[providers]]
+name = "primary"
+type = "resend"
+
+[providers.settings]
+api_key = "${env.RESEND_API_KEY}"
+
+[[endpoints]]
+path = "/api/send"
+auth = "api-key"
+api_keys = ["${env.POSTHORN_API_KEY}"]
+from = "${env.POSTHORN_FROM}"
+to = ["${env.POSTHORN_TO}"]
+required = ["subject", "message"]
+subject = "{{.subject}}"
+body = "{{.message}}"
+dry_run = ${env.POSTHORN_DRY_RUN}
+
+[endpoints.transport]
+providers = ["primary"]
+
+[endpoints.rate_limit]
+count = 30
+interval = "1m"
+
+[storage]
+path = "/var/lib/posthorn/posthorn.db"
+retention = "720h"
+max_size = "1GB"
+
+[logging]
+level = "info"
+format = "json"

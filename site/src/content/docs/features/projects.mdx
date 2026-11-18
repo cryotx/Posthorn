@@ -1,0 +1,294 @@
+---
+title: Projects (multi-tenant)
+description: Several business projects sharing one mail gateway — each with its own API key, sender policy, idempotency scope and delivery-event callback.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+You run more than one thing. A novel site, an account service, an internal tool — each needs to send mail, and none of them should need its own provider account, its own API keys, or its own retry logic.
+
+A **project** is a business tenant of one Posthorn: an identity, a credential, and a sending policy.
+
+```toml
+[[projects]]
+name                 = "novel"
+api_key              = "${env.NOVEL_MAIL_API_KEY}"
+default_from         = "noreply@novel.example.com"
+allowed_from_domains = ["novel.example.com"]
+
+[[projects]]
+name                 = "account"
+api_key              = "${env.ACCOUNT_MAIL_API_KEY}"
+default_from         = "account@example.com"
+allowed_from_domains = ["example.com"]
+```
+
+Your app sends with its own key and never learns which provider carried the mail:
+
+```bash
+curl -X POST https://posthorn.example.com/api/send \
+  -H "Authorization: Bearer $NOVEL_MAIL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: verify:user-4821" \
+  --data '{"to_override":"reader@example.net","subject_line":"Confirm your email","message":"..."}'
+```
+
+<Aside type="note">
+Opt-in. With no `[[projects]]` blocks, Posthorn behaves exactly as it did before — same responses, same status codes, same metric labels.
+</Aside>
+
+## What a project is not
+
+No user registration, no signup flow, no billing, no admin UI. The TOML file remains the source of truth; a project exists because you wrote it down. That is the whole model.
+
+## Authentication
+
+`Authorization: Bearer <project-api-key>`. Posthorn hashes the key at startup and **keeps only the digest** — the plaintext never reaches a log, a metric, an error message or the database. Read it from the environment so your config file doesn't hold it either.
+
+Keys must be at least 24 characters: a project key authorises sending under that project's identity, so a guessable one is an identity takeover, not an inconvenience.
+
+`enabled = false` suspends a project immediately without losing its configuration. A valid key for a disabled project is refused outright — it does **not** fall through to an endpoint's own `api_keys`.
+
+### Adopting projects gradually
+
+Endpoint `api_keys` keep working alongside projects. A token that isn't a project key falls through to the endpoint's list, so you can migrate callers one at a time. Once they're all moved, delete `api_keys` — an endpoint key bypasses the sender policy below.
+
+## Sender policy
+
+This is the control the whole feature turns on, and it is why `allowed_from_domains` is **required and non-empty**. A project that may send as any domain can impersonate every other project on the gateway, so there is deliberately no allow-all default.
+
+| Request | Result |
+|---|---|
+| no `from` | `default_from` is used |
+| `from: support@novel.example.com` | allowed — in the project's domain |
+| `from: admin@other-project.example.org` | **403** `sender_not_allowed` |
+
+```json
+{
+  "error": "sender domain \"b.example.com\" is not in project \"novel\"'s allowed_from_domains [novel.example.com]",
+  "code": "sender_not_allowed"
+}
+```
+
+Patterns are exact (`example.com`) or a suffix wildcard (`*.mail.example.com`). `default_from` is checked against the list at config-parse time, so it can't be a back door. When a project has no `default_from`, the endpoint's own `from` is used — and is **also** checked, because an endpoint is shared infrastructure and must not become a way to send as someone else's domain.
+
+<Aside type="caution">
+A `project` field in a request body is ignored. Identity comes from the credential only — a caller cannot name the project it wants to be.
+</Aside>
+
+Per-request `from` is allowed **only** under project authentication. On a plain api-key endpoint it stays forbidden, exactly as before: without a domain allowlist, a leaked key would enable spoofing any sender at all.
+
+## Idempotency
+
+Send with an `Idempotency-Key` header and a retry of the same request will not send a second email:
+
+```
+Idempotency-Key: verify:user-4821
+```
+
+| Situation | Response |
+|---|---|
+| First request | sends, records the response |
+| Identical retry | replays the recorded response, sends nothing |
+| Same key, **different** payload | `409` `idempotency_key_reused` |
+| Concurrent duplicate in flight | `409` `idempotency_in_flight` |
+
+Keys are scoped to `(project, key)`, so two projects generating the same UUID never collide and one can never observe another's response.
+
+**Concurrency is handled in the database, not in memory.** A hundred simultaneous requests carrying one key produce exactly one email — the reservation is an atomic insert, so exactly one caller wins and the rest get a 409. That matters most for the case it was built for: a verification code that must not arrive twice.
+
+A request is "the same" when its fields, resolved sender and resolved recipients match — so re-serialising your JSON with different key ordering still replays rather than conflicting. A failed send releases the key so your retry can actually reach a provider, and only 2xx/3xx outcomes are recorded (caching a 5xx would make a transient failure permanent for the whole 24-hour TTL).
+
+<Aside type="note">
+Idempotency reservations need [`[storage]`](/features/storage/). Without it Posthorn logs `idempotency_unguarded` and proceeds — a concurrent retry could then send twice.
+</Aside>
+
+## Message identity
+
+Project responses carry a `message_id`:
+
+```json
+{"status":"ok","submission_id":"7d50e314-…","message_id":"7d50e314-…"}
+```
+
+It is the **same value** as `submission_id` on purpose. One logical message has one id, not two names for the same thing — and it stays stable no matter how many providers the [router](/features/routing/) walks:
+
+```
+attempt 1 -> resend  failed  transient   provider_message_id=""
+attempt 2 -> ses     sent                provider_message_id="0100018f-…"
+```
+
+Each attempt is recorded durably: message id, attempt number, provider, timings, result, error class, and the provider's own id. Bodies, recipients and subjects are **not** — the trail answers "who took this and what happened", which needs none of them.
+
+## Delivery events
+
+Provider webhooks are normalized into one shape before anything downstream sees them:
+
+```json
+{
+  "event_id": "ev_d006137848d0aaaa4e86e340e68052bd",
+  "message_id": "7d50e314-b3b7-4031-bb3f-829e23eb5b4f",
+  "project": "novel",
+  "provider": "postmark",
+  "provider_message_id": "b-msg-1",
+  "type": "message.delivered",
+  "timestamp": "2026-09-07T15:30:00Z",
+  "metadata": {"recipient_domain": "example.com", "provider_event": "delivered"}
+}
+```
+
+Types: `message.accepted`, `message.sent`, `message.delivered`, `message.deferred`, `message.bounced`, `message.complained`, `message.failed`, and `message.other` for anything a provider adds later. A Postmark `Delivery` and a Resend `email.delivered` produce the identical `message.delivered` — your code never branches on a provider's dialect.
+
+### Verifying provider callbacks
+
+Posthorn only accepts a provider callback it can actually authenticate. Configure the scheme that provider publishes:
+
+```toml
+[lifecycle]
+basic_auth_username = "${env.EVENTS_USER}"
+basic_auth_password = "${env.EVENTS_PASSWORD}"
+
+# Resend signs its payloads (Standard Webhooks / Svix).
+[lifecycle.providers.resend]
+signing_secret = "${env.RESEND_WEBHOOK_SECRET}"
+
+# Postmark does NOT sign payloads. Basic auth is the gate; the IP
+# allowlist is defence in depth.
+[lifecycle.providers.postmark]
+allowed_ips     = ["3.134.147.250", "50.31.156.6", "50.31.156.77", "18.217.206.57"]
+trusted_proxies = ["10.0.0.0/8"]
+```
+
+A dialect gets a route (`/events/<provider>/unified`) **only** when you configure it — an unconfigured provider has no open door.
+
+**Resend** is verified per the Standard Webhooks spec: `svix-id` / `svix-timestamp` / `svix-signature`, signed content `{id}.{timestamp}.{raw body}`, HMAC-SHA256 under the base64-decoded secret, constant-time compare, and a 5-minute timestamp window. Verification uses the raw request bytes, so a proxy that reformats JSON in flight will break signatures — that is the signature working, not a bug.
+
+**Postmark does not sign webhook payloads.** Its own documentation says so and recommends basic auth plus IP allowlisting instead, which is exactly what Posthorn implements. Setting `signing_secret` for Postmark is a config error rather than a no-op, because accepting it would leave you believing payloads were verified when they cannot be.
+
+<Aside type="caution">
+Know the boundary this leaves: **for Postmark, anyone who learns the basic-auth credential can forge delivery events** — marking messages bounced and, through auto-suppression, blocking real recipients. `allowed_ips` narrows that to Postmark's published egress, but it authenticates the network path, not the payload, and those addresses are Postmark's to change. Treat the events endpoint credential as a secret of the same weight as a provider API key.
+</Aside>
+
+A request that fails verification gets a `401` and does nothing else: no event is recorded, no message state changes, no webhook of yours fires.
+
+Redelivered events are collapsed. Providers that mint a stable per-event id (Resend's `svix-id`) supply the key directly; for others it is derived from the event's content. Either way a retry produces no second event and no second callback to you.
+
+```
+posthorn_provider_webhook_total{provider,result}
+# result: accepted | invalid_signature | duplicate | invalid_payload | unknown_message | internal_error
+```
+
+### Your own webhook
+
+```toml
+[[projects]]
+name           = "novel"
+# ...
+webhook_url    = "https://novel.example.com/hooks/mail"
+webhook_secret = "${env.NOVEL_WEBHOOK_SECRET}"
+```
+
+Requests are signed `X-Posthorn-Signature: sha256=<hex>` — HMAC-SHA256 of the body under your secret. Verify with a constant-time compare:
+
+```python
+expected = "sha256=" + hmac.new(SECRET, body, hashlib.sha256).hexdigest()
+if not hmac.compare_digest(expected, request.headers["X-Posthorn-Signature"]):
+    abort(401)
+```
+
+`event_id` and `timestamp` are **inside the signed body** (and mirrored as `X-Posthorn-Event-Id` / `X-Posthorn-Timestamp` headers for convenience). Dedupe on `event_id` and reject old timestamps — a header alone is unauthenticated and could be rewritten, which is why the values that matter live under the signature.
+
+A receiver that's down doesn't lose events: delivery retries with backoff through the same queue mail uses, and terminates in a dead-letter state rather than silently vanishing. A redelivery carries the **same** `event_id`, so your dedupe recognises it as a retry.
+
+Project webhooks need `[lifecycle]` and `[storage]` — that's enforced at config parse, because a callback with nowhere to queue would drop events on the receiver's first outage.
+
+## SMTP projects
+
+Apps that only speak SMTP get the same identity:
+
+```toml
+[[projects]]
+name          = "novel"
+# ...
+smtp_username = "novel"
+smtp_password = "${env.NOVEL_SMTP_PASSWORD}"
+```
+
+Same registry, same project context, same sender policy — applied after MIME parsing, because the `From` in an inbound message is submitter-controlled by definition. A spoofed sender gets `550 5.7.1 Sender not permitted for this project`. The listener's own `smtp_users` keep working for non-project apps.
+
+## Usage and metrics
+
+```
+posthorn_project_send_total{project,status}          # sent | queued | failed | suppressed | sender_rejected
+posthorn_project_delivery_total{project,event}       # by unified event type
+posthorn_project_provider_total{project,provider}    # which upstream carried it
+posthorn_project_send_duration_seconds{project}
+```
+
+Per-project success/failure counts are also persisted per day and per month, period-keyed so they roll over with no scheduled job.
+
+Labels are project names, provider names and closed enums — never a recipient, subject, address, message id or idempotency key.
+
+## Isolation
+
+- A project can only send as its own domains, enforced server-side on both HTTP and SMTP.
+- Idempotency keys are scoped per project; one tenant cannot read another's recorded response.
+- Submission rows carry project ownership from this release, so any future query surface is scoped to its tenant by construction.
+- API keys, SMTP passwords and webhook secrets never reach logs, metrics, errors or the database in plaintext.
+- Message bodies are not written to the attempt or event tables, and a normalized event carries a recipient **domain**, never the address.
+
+## Project quotas
+
+Give a project its own budget and Posthorn enforces it:
+
+```toml
+[[projects]]
+name          = "novel"
+# ...
+daily_limit   = 5000
+monthly_limit = 100000
+```
+
+A project that has spent its allowance is **refused**, not rerouted:
+
+```json
+{"error":"this project has reached its daily send limit",
+ "code":"project_quota_exhausted","fields":{"window":"daily"}}
+```
+
+HTTP `429`; SMTP `452 4.7.1` — a *temporary* failure, because the allowance comes back on a calendar boundary and a sending MTA that queues and retries will succeed.
+
+This is deliberately the opposite response to a [provider quota](/features/quota-and-cost/) running out. The two look similar and mean opposite things:
+
+| | Provider quota exhausted | Project quota exhausted |
+|---|---|---|
+| Meaning | *this upstream* is out of allowance | *this caller* is out of allowance |
+| Response | try the next provider | refuse the request |
+| Circuit breaker | untouched | untouched |
+| Retry queue | holds the message | **does not** queue |
+
+Queueing a project's over-limit send would be actively wrong: holding a verification code until midnight is worse for the user than telling the caller now.
+
+**Strict under concurrency.** With a limit of 100 and 99 spent, a hundred simultaneous requests admit exactly one — the allowance is reserved under the same lock that reads it. A failed send releases its reservation, so a broken provider never eats a tenant's budget. Strictness is per Posthorn process; two instances sharing one project are soft, which is the same single-writer assumption `[storage]` already makes.
+
+**A replay costs nothing.** Idempotency is checked *before* quota, so a client retrying a request it already made replays the recorded response without spending a second unit — and a retry storm cannot drain a tenant's daily budget without sending anything. Dry runs and fully-suppressed sends cost nothing either.
+
+```
+posthorn_project_quota_limit{project,window}
+posthorn_project_quota_remaining{project,window}
+posthorn_project_quota_exhausted_total{project,window}
+```
+
+Projects with no configured limit are absent from these gauges rather than showing a fabricated ceiling.
+
+## Message state
+
+Each message carries a `delivery_state` projected from its events — `message.accepted` through `message.complained` — so "what happened to this message" is one read rather than a scan. The projection is by **event time**, so a late-arriving stale callback cannot move it backwards, and at equal timestamps a complaint outranks a delivery.
+
+The events remain the record of fact. Nothing is ever removed or rewritten to maintain the projection; if the two disagreed, the events would win.
+
+## What is not built yet
+
+- **A query API.** There is no HTTP surface for reading a project's own submissions or events yet. The schema carries ownership so one can be added scoped correctly.
+- **Recipient restrictions.** The sender policy bounds who a project sends *as*, not who it sends *to*.
+- **Provider webhook signature verification.** Ingestion is protected by the endpoint's mandatory basic auth. Per-provider signature schemes (Svix for Resend, SNS for SES) are added per provider against their live docs, not from memory.

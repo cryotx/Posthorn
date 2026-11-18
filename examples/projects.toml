@@ -1,0 +1,185 @@
+# Posthorn — multi-project gateway example
+#
+# Several business projects sharing one mail infrastructure. Each gets
+# its own API key, its own sender policy, and its own delivery-event
+# callback; none can send as another's domain.
+#
+#   posthorn validate --config examples/projects.toml
+#
+# Entirely opt-in: delete the [[projects]] blocks and this is an
+# ordinary single-tenant Posthorn config.
+
+# ---------------------------------------------------------------------
+# Storage is required for the project surface to be useful: idempotency
+# reservations, the per-message attempt trail, delivery events, project
+# usage counters and the webhook retry queue all live here.
+# ---------------------------------------------------------------------
+
+[storage]
+path = "/var/lib/posthorn/posthorn.db"
+
+# Event ingestion. Provider webhooks post here; Posthorn normalizes
+# them and forwards to each project's own callback.
+#
+# Basic auth is mandatory and fail-closed for every dialect. What each
+# provider adds on top differs, because their published schemes differ
+# — Posthorn implements what each one actually offers rather than a
+# uniform pretence.
+[lifecycle]
+basic_auth_username = "${env.EVENTS_USER}"
+basic_auth_password = "${env.EVENTS_PASSWORD}"
+
+# Resend SIGNS its payloads (Standard Webhooks / Svix): the signature
+# covers the raw body under this secret, with a 5-minute timestamp
+# window. A dialect is only mounted at /events/<name>/unified when it
+# appears here.
+[lifecycle.providers.resend]
+signing_secret = "${env.RESEND_WEBHOOK_SECRET}"
+
+# Postmark does NOT sign webhook payloads — its own documentation says
+# so and recommends basic auth plus IP allowlisting instead. Setting
+# signing_secret here is a config error, not a no-op: accepting it
+# would leave you believing payloads were verified when they cannot be.
+#
+# Know the boundary: anyone holding the basic-auth credential above can
+# forge Postmark events. allowed_ips narrows that to Postmark's
+# published egress, but it authenticates the network path, not the
+# payload, and those addresses are Postmark's to change.
+[lifecycle.providers.postmark]
+allowed_ips = ["3.134.147.250", "50.31.156.6", "50.31.156.77", "18.217.206.57"]
+# trusted_proxies = ["10.0.0.0/8"]   # required if you terminate TLS in front
+
+# ---------------------------------------------------------------------
+# Providers — shared infrastructure. Projects never name a provider;
+# they name nothing at all. Which upstream carries their mail is an
+# operator decision they are deliberately insulated from.
+# ---------------------------------------------------------------------
+
+[[providers]]
+name          = "resend-free"
+type          = "resend"
+cost_per_1000 = 0
+[providers.settings]
+api_key = "${env.RESEND_API_KEY}"
+[providers.quota]
+daily_limit = 100
+
+[[providers]]
+name          = "postmark-paid"
+type          = "postmark"
+cost_per_1000 = "0.50"
+[providers.settings]
+api_key = "${env.POSTMARK_API_KEY}"
+
+# ---------------------------------------------------------------------
+# Projects — the business tenants.
+#
+# api_key authenticates HTTP callers as this project. Read it from the
+# environment: Posthorn keeps only a SHA-256 digest at runtime, and the
+# config file should not hold the plaintext either.
+#
+# allowed_from_domains is the anti-spoofing control and is REQUIRED.
+# A project that may send as any domain can impersonate every other
+# project on this gateway, so there is no allow-all default.
+# ---------------------------------------------------------------------
+
+[[projects]]
+name                 = "novel"
+api_key              = "${env.NOVEL_MAIL_API_KEY}"
+default_from         = "noreply@novel.example.com"
+allowed_from_domains = ["novel.example.com"]
+
+# Delivery events for this project's mail, normalized and signed.
+# The receiver never learns which provider carried the message.
+webhook_url    = "https://novel.example.com/hooks/mail"
+webhook_secret = "${env.NOVEL_WEBHOOK_SECRET}"
+
+# The project's OWN budget, enforced. Over-limit requests are refused
+# with 429 project_quota_exhausted (SMTP: 452) — NOT rerouted to
+# another provider and NOT queued, because holding a verification code
+# until midnight is worse than telling the caller now.
+#
+# A different dimension from [providers.quota]: a project budget bounds
+# one tenant's volume, a provider quota bounds an upstream account's
+# allowance. A caller can always tell which one ran out.
+daily_limit   = 5000
+monthly_limit = 100000
+
+# This project also submits over SMTP. Same registry, same identity:
+# an SMTP session authenticated here produces the same project context
+# an HTTP request does, including the sender policy.
+smtp_username = "novel"
+smtp_password = "${env.NOVEL_SMTP_PASSWORD}"
+
+[[projects]]
+name                 = "account"
+api_key              = "${env.ACCOUNT_MAIL_API_KEY}"
+default_from         = "account@example.com"
+allowed_from_domains = ["example.com", "*.mail.example.com"]
+webhook_url          = "https://api.example.com/hooks/mail"
+webhook_secret       = "${env.ACCOUNT_WEBHOOK_SECRET}"
+
+# A suspended project: the key stops working immediately, without the
+# operator losing the configuration.
+[[projects]]
+name                 = "legacy-shop"
+enabled              = false
+api_key              = "${env.LEGACY_SHOP_API_KEY}"
+default_from         = "shop@legacy.example.com"
+allowed_from_domains = ["legacy.example.com"]
+
+# ---------------------------------------------------------------------
+# One endpoint, many projects.
+#
+# The endpoint is the SHAPE of a request (templates, validation,
+# routing); the project is the IDENTITY behind it. Any project's key
+# authenticates here, and each one's mail goes out under its own
+# sender policy.
+#
+# `api_keys` is optional once projects exist — keep it only while
+# migrating callers over, then delete it.
+# ---------------------------------------------------------------------
+
+[[endpoints]]
+path      = "/api/send"
+to        = ["fallback@example.com"]
+from      = "noreply@example.com"
+auth      = "api-key"
+required  = ["subject_line", "message"]
+subject   = "{{.subject_line}}"
+body      = "{{.message}}"
+mail_kind = "notification"
+
+[endpoints.transport]
+strategy  = "free_first"
+providers = ["resend-free", "postmark-paid"]
+
+# Time-critical mail skips the free tier entirely.
+[[endpoints.transport.rules]]
+match_kind = ["verification", "password_reset"]
+providers  = ["postmark-paid"]
+
+# ---------------------------------------------------------------------
+# The SMTP door. Projects with smtp_username/smtp_password authenticate
+# here and get the same sender policy as on HTTP.
+# ---------------------------------------------------------------------
+
+[smtp_listener]
+listen          = ":2525"
+require_tls     = true
+tls_cert        = "/etc/posthorn/cert.pem"
+tls_key         = "/etc/posthorn/key.pem"
+auth_required   = "smtp-auth"
+allowed_senders = ["*@novel.example.com", "*@example.com"]
+
+# The listener's own credentials still work for non-project apps.
+[[smtp_listener.smtp_users]]
+username = "ghost"
+password = "${env.GHOST_SMTP_PASSWORD}"
+
+[smtp_listener.transport]
+providers = ["postmark-paid"]
+
+[logging]
+level  = "info"
+format = "json"

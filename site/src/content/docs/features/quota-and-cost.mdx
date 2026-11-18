@@ -1,0 +1,212 @@
+---
+title: Quota & cost routing
+description: Give each provider a send budget and a price, then let Posthorn spend the free allowance first and fall back to paid only when it runs out.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Most self-hosted operators are not on one provider by choice — they are on one provider's free tier, with a paid account behind it for the month that tier runs out. Posthorn can manage that boundary for you:
+
+```toml
+[[providers]]
+name = "resend-free"
+type = "resend"
+cost_per_1000 = 0
+[providers.settings]
+api_key = "${env.RESEND_API_KEY}"
+[providers.quota]
+daily_limit   = 100
+monthly_limit = 3000
+
+[[providers]]
+name = "ses-paid"
+type = "ses"
+cost_per_1000 = "0.10"
+[providers.settings]
+region            = "us-east-1"
+access_key_id     = "${env.AWS_ACCESS_KEY_ID}"
+secret_access_key = "${env.AWS_SECRET_ACCESS_KEY}"
+
+[endpoints.transport]
+strategy  = "free_first"
+providers = ["resend-free", "ses-paid"]
+```
+
+Every message goes to Resend until the free allowance is gone, then to SES, then back to Resend when the window resets. No cron, no manual switchover.
+
+<Aside type="note">
+All of this is opt-in. A config with no `quota` or `cost_per_1000` fields behaves exactly as it did before — same send path, same metric labels, same status codes.
+</Aside>
+
+## Budgets
+
+`[providers.quota]` takes `daily_limit` and `monthly_limit`. Zero, or an absent block, means unlimited.
+
+**Only successful sends count.** A provider that rejected or failed a message did not spend your allowance on it — counting attempts would let a broken provider burn a paid budget by failing.
+
+When a provider's budget is spent it stops being a routing candidate. When *every* provider in a route is out of budget, the send fails with a distinct error:
+
+```
+transport: every provider in route has spent its send quota (2 provider(s)) (class=quota_exhausted)
+```
+
+### Windows are UTC
+
+Day and month boundaries are UTC. Every provider's own reset window is in its own timezone and no two agree, so any local-time choice would be confidently wrong for most of them. UTC is wrong for all of them in the same predictable way — leave a little headroom in your limits for the offset.
+
+### Rollover needs no cron
+
+Counters are stored keyed by their period (`2026-09-07`, `2026-09`). A new day is a new key, so yesterday's count is simply never read again.
+
+That means there is nothing to run at midnight and nothing to miss. A Posthorn that was stopped, asleep, or crashed across the boundary — or across three of them — computes the right window on its next send.
+
+## Persistence
+
+With a [`[storage]`](/features/storage/) block, usage is written through to SQLite and restored at startup, so a restart does not hand every provider a fresh allowance:
+
+```
+{"msg":"provider_quota_enabled","source":"local","persistent":true}
+```
+
+**Without `[storage]`, counters live only in memory and a restart resets them.** If you are relying on a monthly free tier, configure storage — a container that restarts twice a week would otherwise never notice the limit.
+
+A failed usage write degrades rather than blocks: the message went out, the counter is short by one, and the error surfaces through the storage health signal. Mail comes before bookkeeping.
+
+## Prices
+
+`cost_per_1000` is the price per 1000 messages. Three forms are accepted:
+
+```toml
+cost_per_1000 = "0.10"   # decimal string — exact, and the recommended form
+cost_per_1000 = 0.10     # float — quantised to 6 decimal places at parse time
+cost_per_1000 = 2        # integer — whole currency units
+```
+
+Money is held as a fixed-point integer and compared as one. Nothing after config parsing touches a float, so `cheapest` cannot pick a different provider on different runs because two prices differ in the seventh decimal place.
+
+Posthorn does not convert currencies. If your providers bill in different ones, normalise before writing the config — a pool priced in two currencies is a mistake Posthorn cannot see.
+
+## Cost-aware strategies
+
+| Strategy | Order |
+|---|---|
+| `free_first` | every `cost_per_1000 = 0` provider first, then the paid ones; declared order inside each tier |
+| `cheapest` | ascending price; ties broken by declared order |
+
+Both are deterministic — the same config always produces the same order — and both still fail over on transient errors exactly like [`failover`](/features/routing/).
+
+Neither strategy looks at quota, and it does not need to: an exhausted provider is skipped when the message is sent, so `free_first` walks onto the paid tier by itself.
+
+## Quota is not a health failure
+
+This is the distinction the whole design turns on.
+
+A **broken** provider is a health event: the [circuit breaker](/configuration/providers/#circuit-breakers) trips, the provider is skipped for a cooldown, and something needs fixing. An **exhausted** provider is working perfectly and simply may not be used until the window resets.
+
+So quota is checked *before* the breaker and never touches it. A provider whose free tier runs out every afternoon keeps a closed circuit all month. The two also get separate metrics, because they call for different responses — one is an incident, the other is a purchasing decision:
+
+```
+posthorn_provider_skipped_total{provider}                    # circuit open — broken
+posthorn_provider_quota_exhausted_total{provider,window}     # out of allowance
+```
+
+### What the caller sees
+
+| Situation | Response |
+|---|---|
+| Budget spent, `[storage]` configured | `202 {"status":"queued"}` (api) / `200 {"status":"queued"}` (form) — held until the window rolls over |
+| Budget spent, no storage | `503` with `no provider has send quota remaining` |
+| Provider rejected the message | `502`, unchanged |
+
+A quota-blocked message is **never** dead-lettered: it will send perfectly well after midnight, so the [retry queue](/features/storage/) holds it. It is also never retried *inline* — no backoff inside a 10-second request outlives a daily budget.
+
+## Mail kinds
+
+Messages can carry a routing label, so a password reset and a weekly digest take different paths:
+
+```toml
+[[endpoints]]
+path      = "/api/send"
+mail_kind = "notification"     # the endpoint's default
+# ...
+
+[endpoints.transport]
+providers = ["ses-paid"]
+
+[[endpoints.transport.rules]]
+match_kind = ["verification", "password_reset"]
+providers  = ["postmark-fast"]
+
+[[endpoints.transport.rules]]
+match_kind = ["notification", "marketing"]
+group      = "free_pool"
+```
+
+The set is closed: `verification`, `password_reset`, `notification`, `important`, `marketing`. It is deliberately small — a free-form label is the first step toward the campaign taxonomy Posthorn will never build. If you need a finer distinction, [`match_field`](/features/routing/#match_field) already covers it.
+
+API-mode callers can override the endpoint default per request:
+
+```bash
+curl -X POST https://posthorn.example.com/api/send \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  --data '{"mail_kind":"password_reset","to_override":"user@example.com", ...}'
+```
+
+An unrecognised value is a `422`, not a fallback. Form-mode endpoints ignore a submitted `mail_kind` entirely (a browser form's purpose is a property of the endpoint), and the SMTP listener takes its kind from `[smtp_listener].mail_kind` — an inbound header is exactly the submitter-controlled value that must not steer routing.
+
+## Provider groups
+
+When several endpoints share the same provider list, name it once:
+
+```toml
+[[provider_groups]]
+name      = "free_pool"
+providers = ["resend-free", "brevo-free", "ses-paid"]
+strategy  = "free_first"
+
+[endpoints.transport]
+group = "free_pool"
+```
+
+A group is a config-level alias — it resolves to exactly the provider list and strategy an inline block would produce. A referencing block may override the strategy; `group` and `providers` are mutually exclusive.
+
+Groups and providers share one name space, so `group = "x"` and `providers = ["x"]` can never mean two different things.
+
+## Watching it
+
+```
+posthorn_provider_quota_remaining{provider,window}      # sends left in the window
+posthorn_provider_quota_limit{provider,window}          # the configured ceiling
+posthorn_provider_quota_exhausted_total{provider,window}
+posthorn_route_quota_exhausted_total{router}            # nobody had budget
+posthorn_provider_cost_per_1000_micros{provider}        # price, in millionths
+```
+
+Providers with no configured limit are absent from the quota gauges rather than showing a fabricated ceiling, so an alert written against `quota_remaining` stays meaningful.
+
+A useful pair: alert when `posthorn_provider_quota_remaining` on your free tier trends toward zero earlier each day, and on any increase in `posthorn_route_quota_exhausted_total`.
+
+## Where this is not the answer
+
+Quota routing is for managing allowances you legitimately have: a free tier, a paid account behind it, a cost ceiling, a second provider for when the first has an incident.
+
+It is **not** a way around a provider's limits. Posthorn has no multi-account rotation, no facility for spreading one logical sender across several accounts at one provider, and nothing that helps evade rate limits or anti-abuse controls. If you need more capacity than a provider's terms allow, the answer is a bigger plan or another provider — not a router.
+
+## Concurrency
+
+Quota is **strict within a process**: the allowance is reserved under the same lock that reads it, so with a limit of 100 and 99 spent, a hundred simultaneous sends produce exactly one more message — not a hundred. A reservation for a send that then fails is handed back, so a flaky provider never eats your allowance.
+
+The honest limitation: strictness is per Posthorn process. Two instances sharing one provider account are a soft quota by construction — which is the same single-writer assumption [`[storage]`](/features/storage/) already makes.
+
+## Remote quota
+
+`quota_source = "remote"` — reading a provider's own usage API instead of counting locally — is **reserved and rejected at parse time**, not silently ignored. Only `"local"` works today.
+
+The machinery behind it is built and tested, and the design decision is worth stating because it constrains any future adapter: a provider's usage API is **advisory reconciliation**, never a gate. Those APIs lag, round, count differently (messages vs recipients), and include sends Posthorn never made. So a remote reading may only ever **raise** the local counter, never lower it — refunding allowance that is already spent is the exact failure quota exists to prevent, while over-counting on a stale read costs at most a premature failover.
+
+No vendor adapter ships. Resend, SES, Mailgun, Brevo and SMTP2GO each need their live API read carefully, and one written from memory would feed confident, wrong numbers into a budget.
+
+## What is not built yet
+
+- **Per-provider currency or spend caps.** `cost_per_1000` orders routes; it does not stop at a budget in money.
+- **Local-time quota windows.** Periods are UTC.

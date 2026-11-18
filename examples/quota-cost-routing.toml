@@ -1,0 +1,173 @@
+# Posthorn — quota-aware + cost-aware routing example
+#
+# The shape most self-hosted operators actually have: a free tier, a
+# paid account behind it, and a wish that the switchover happened by
+# itself.
+#
+#   posthorn validate --config examples/quota-cost-routing.toml
+#
+# Everything here is additive on top of examples/multi-provider.toml.
+# Drop the quota/cost/kind blocks and you have exactly that file's
+# behavior back.
+
+# ---------------------------------------------------------------------
+# Storage is what makes budgets survive a restart.
+#
+# Without it, usage counters live only in memory and a container
+# restart hands every provider a fresh allowance — which quietly
+# defeats a monthly limit. With it, counters are written through to
+# SQLite and restored at startup.
+# ---------------------------------------------------------------------
+
+[storage]
+path = "/var/lib/posthorn/posthorn.db"
+
+# ---------------------------------------------------------------------
+# Providers, with budgets and prices
+#
+# cost_per_1000 is fixed-point: prefer the exact decimal-string form.
+# Only SUCCESSFUL sends count against a quota — a provider that fails
+# does not spend your allowance.
+#
+# Limits are per UTC calendar day / month, and roll over on the
+# calendar boundary with no scheduled job: counters are keyed by
+# period, so a new day is simply a new key. A Posthorn that was down at
+# midnight still rolls over correctly on its next send.
+# ---------------------------------------------------------------------
+
+[[providers]]
+name          = "resend-free"
+type          = "resend"
+cost_per_1000 = 0                       # the free tier
+[providers.settings]
+api_key = "${env.RESEND_API_KEY}"
+[providers.quota]
+daily_limit   = 100
+monthly_limit = 3000
+
+[[providers]]
+name          = "brevo-free"
+type          = "smtp"
+cost_per_1000 = 0                       # a second free tier
+[providers.settings]
+host     = "smtp-relay.brevo.com"
+port     = 587
+username = "${env.BREVO_SMTP_USER}"
+password = "${env.BREVO_SMTP_PASSWORD}"
+[providers.quota]
+daily_limit = 300
+
+[[providers]]
+name          = "ses-paid"
+type          = "ses"
+cost_per_1000 = "0.10"                  # cheap at volume, no limit
+[providers.settings]
+region            = "us-east-1"
+access_key_id     = "${env.AWS_ACCESS_KEY_ID}"
+secret_access_key = "${env.AWS_SECRET_ACCESS_KEY}"
+
+[[providers]]
+name          = "postmark-premium"
+type          = "postmark"
+cost_per_1000 = "1.25"                  # deliverability first, price second
+[providers.settings]
+api_key = "${env.POSTMARK_API_KEY}"
+# A tighter breaker: this is the provider that must not be limping when
+# a password reset needs it.
+[providers.circuit_breaker]
+failure_threshold = 3
+cooldown          = "15s"
+
+# ---------------------------------------------------------------------
+# Provider groups: name a list once, reference it everywhere
+#
+# A group is a config-level alias — it resolves to exactly the provider
+# list and strategy an inline block would produce. Groups and providers
+# share one name space, so `group = "x"` and `providers = ["x"]` can
+# never mean two different routes.
+# ---------------------------------------------------------------------
+
+[[provider_groups]]
+name      = "free_pool"
+providers = ["resend-free", "brevo-free", "ses-paid"]
+strategy  = "free_first"                # free tiers first, SES when both are spent
+
+[[provider_groups]]
+name      = "premium_pool"
+providers = ["postmark-premium", "ses-paid"]
+strategy  = "failover"
+
+[[provider_groups]]
+name      = "cheapest_pool"
+providers = ["ses-paid", "postmark-premium"]
+strategy  = "cheapest"
+
+# ---------------------------------------------------------------------
+# A transactional API endpoint routed by what the mail IS
+#
+# mail_kind is a closed set: verification, password_reset, notification,
+# important, marketing. api-mode callers may override the endpoint
+# default per request against that same set — a caller can pick among
+# the routes you wrote and nothing else.
+# ---------------------------------------------------------------------
+
+[[endpoints]]
+path      = "/api/send"
+to        = ["fallback@example.com"]
+from      = "YourApp <noreply@example.com>"
+auth      = "api-key"
+api_keys  = ["${env.APP_API_KEY}"]
+required  = ["subject_line", "message"]
+subject   = "{{.subject_line}}"
+body      = "{{.message}}"
+mail_kind = "notification"              # the default when a caller says nothing
+
+# Anything that matches no rule takes the cheap pool.
+[endpoints.transport]
+group = "cheapest_pool"
+
+# A user staring at a "check your inbox" screen gets the provider with
+# the best deliverability, whatever it costs.
+[[endpoints.transport.rules]]
+match_kind = ["verification", "password_reset"]
+group      = "premium_pool"
+
+# Routine app traffic drains the free tiers first.
+[[endpoints.transport.rules]]
+match_kind = ["notification", "marketing"]
+group      = "free_pool"
+
+# Invoices and legal notices: premium, regardless of kind defaults.
+[[endpoints.transport.rules]]
+match_kind = ["important"]
+group      = "premium_pool"
+
+# ---------------------------------------------------------------------
+# A contact form: no kinds, just spend the free allowance first
+# ---------------------------------------------------------------------
+
+[[endpoints]]
+path            = "/api/contact"
+to              = ["you@example.com"]
+from            = "Contact Form <noreply@example.com>"
+honeypot        = "_gotcha"
+allowed_origins = ["https://example.com"]
+required        = ["name", "email", "message"]
+subject         = "Contact from {{.name}}"
+body            = """
+From: {{.name}} <{{.email}}>
+
+{{.message}}
+"""
+
+[endpoints.transport]
+strategy  = "free_first"
+providers = ["resend-free", "ses-paid"]
+
+[endpoints.rate_limit]
+count    = 5
+interval = "1m"
+
+[logging]
+level  = "info"
+format = "json"

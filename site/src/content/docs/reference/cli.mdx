@@ -1,0 +1,252 @@
+---
+# Modified for the cryotx/posthorn distribution.
+title: CLI
+description: Subcommands and flags for the posthorn binary.
+---
+
+The `posthorn` binary exposes these subcommands.
+
+```bash
+posthorn <subcommand> [flags]
+```
+
+## `serve`
+
+Starts the listener(s) — HTTP always, plus the inbound SMTP listener if `[smtp_listener]` is configured.
+
+```bash
+posthorn serve --config /etc/posthorn/config.toml
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config <path>` | `/etc/posthorn/config.toml` | Path to TOML config file |
+| `--listen <addr>` | `:8080` | HTTP bind address |
+
+The SMTP listener's bind address is configured in the TOML (`smtp_listener.listen`), not via a flag.
+
+### Behavior
+
+1. Load and validate the config (same checks `validate` runs).
+2. Construct handlers, transports, rate limiters, templates per endpoint.
+3. Bind the HTTP listener and (if configured) the SMTP listener — each in its own goroutine.
+4. Serve until SIGTERM/SIGINT.
+
+### Signal handling
+
+| Signal | Effect |
+|---|---|
+| `SIGTERM` | Graceful shutdown: stop accepting new connections, drain in-flight requests with a 15-second deadline, exit 0 |
+| `SIGINT` (Ctrl+C) | Same as SIGTERM |
+| Second `SIGTERM` / `SIGINT` | Force-exit immediately with code 1 |
+
+The 15-second drain deadline is intentionally longer than the per-request 10-second hard timeout, so any in-flight retry can complete gracefully. Press Ctrl+C twice in a terminal to force-exit a stuck process.
+
+### Logs
+
+`serve` writes structured JSON logs to stdout. With Docker, those are captured by the platform's logging driver. With systemd, they go to the journal. See [Log format](/reference/log-format/) for the full event catalog.
+
+A successful startup looks like:
+
+```json
+{"time":"2026-05-16T19:00:00Z","level":"INFO","msg":"posthorn starting","version":"v1.0.0","listen":":8080","config":"/etc/posthorn/config.toml","endpoints":2}
+{"time":"2026-05-16T19:00:00Z","level":"INFO","msg":"endpoint registered","path":"/api/contact","transport":"postmark","recipients":1}
+{"time":"2026-05-16T19:00:00Z","level":"INFO","msg":"http ingress listening","addr":":8080"}
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Clean shutdown after SIGTERM/SIGINT |
+| `1` | Runtime error (config load failed, listener bind failed, transport build failed) |
+| `2` | Unknown subcommand or argument parsing failed |
+
+## `validate`
+
+Parses and validates the config without starting the listener.
+
+```bash
+posthorn validate --config /etc/posthorn/config.toml
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config <path>` | `/etc/posthorn/config.toml` | Path to TOML config file |
+
+### What it checks
+
+1. TOML syntax — file parses cleanly.
+2. `${env.VAR}` placeholders — every referenced env var is set (all missing reported in one error).
+3. Schema — required fields present, types match, paths start with `/`.
+4. Templates — `subject` and `body` Go templates compile.
+5. Mode/defense mutex — api-mode endpoints don't carry form-mode-only fields (`honeypot`, `allowed_origins`, `redirect_*`, `csrf_secret`); form-mode endpoints don't carry api-mode-only fields (`api_keys`, `idempotency_cache_size`).
+6. Allowed-origin sanity — `allowed_origins = []` is rejected.
+7. Path uniqueness — no two HTTP endpoints share a path.
+8. SMTP listener structural checks (when `[smtp_listener]` is present) — `listen` present, `allowed_senders` non-empty, auth shape valid, TLS material consistent with mode.
+
+### Output
+
+On success:
+
+```text
+$ posthorn validate --config posthorn.toml
+config OK: 2 endpoint(s)
+```
+
+Exit 0.
+
+On failure, the first error is printed to stderr and exit is non-zero. Errors are surfaced one at a time — fix the reported error and re-run to see the next, if any:
+
+```text
+$ posthorn validate --config posthorn.toml
+posthorn: config: endpoints[0] (/api/contact): transport: postmark transport requires settings.api_key
+exit status 1
+```
+
+### Use cases
+
+- **Pre-deploy check.** Run `validate` in CI before deploying a new config. Catch typos before they take down the listener.
+- **Pre-flight, not a health check.** `validate` proves the config is loadable; it says nothing about whether the running process is serving. Use `probe` for that — a container whose listener has died passes `validate` happily.
+- **Pre-commit hook.** Run `validate` from `.git/hooks/pre-commit` to prevent committing a broken config.
+
+
+## `doctor`
+
+Checks everything an operator would otherwise discover at 3am, in one command while they are awake.
+
+```bash
+posthorn doctor --config /etc/posthorn/config.toml
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config <path>` | `/etc/posthorn/config.toml` | Path to TOML config file |
+| `--provider <name>` | — | Additionally build the named pool provider from its real credentials |
+
+### What it checks
+
+- Config parses and validates; at least one ingress; no duplicate endpoint paths.
+- The provider pool, and that every registered provider type declares its capabilities.
+- Which providers publish **no webhook payload signature**, so you know which callbacks rest on basic auth alone.
+- Projects, sender policy, and any **unfinished key rotation** (two keys live).
+- The SSRF policy, and whether each configured `webhook_url` currently resolves to an address the policy allows — before an event needs delivering.
+- That the admin credential is distinct from every project key.
+- Storage writability, proven **by writing** a temporary file, not by reading a mode bit.
+- Schema version against this binary: current, will-migrate, or too new to open.
+- Retry queue depth and dead-letter count.
+
+`--provider <name>` builds the transport from the configured credentials and reports whether it is usable. It deliberately **does not send mail**.
+
+### Secrets
+
+`doctor` output is the thing operators paste into issues, so it never prints a credential — not a key, not a password, not a fragment. Checks report the *shape* of a credential (present, long enough, distinct) and never its value. A test asserts this by putting sentinel values in every credential slot and failing if any appears in the output.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | All checks passed (warnings do not fail) |
+| `1` | At least one check failed |
+
+## `probe`
+
+The container healthcheck: probes the **running process** over HTTP.
+
+```bash
+posthorn probe --url http://127.0.0.1:8080/readyz
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--url <url>` | `http://127.0.0.1:8080/readyz` | Readiness URL |
+| `--timeout <d>` | `3s` | Probe timeout |
+| `--quiet` | off | Report only via the exit code |
+
+It ships as a subcommand because the production image is distroless — no curl, no wget, no shell — and that is worth keeping.
+
+It probes `/readyz`, not `/healthz`: readiness covers storage being writable and the workers being up, and deliberately stays ready when a *provider* is down. An upstream outage is what the retry queue and failover absorb; restarting the container would drop the mail the queue is holding.
+
+Redirects are not followed — a 3xx from this endpoint means something is in front of it that should not be.
+
+## `backup`
+
+Writes a consistent snapshot **without stopping Posthorn**.
+
+```bash
+posthorn backup --config /etc/posthorn/config.toml --out /backups/posthorn-2026-09-08.db
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config <path>` | `/etc/posthorn/config.toml` | Path to TOML config file |
+| `--out <file>` | `<db>.backup-<timestamp>` | Backup file to write |
+
+It uses SQLite's `VACUUM INTO` rather than copying files. Copying the `.db` is wrong for a WAL database in two ways at once: recent writes live in the `-wal` file, so a copy of the `.db` alone silently loses them, and there is no instant at which `cp` sees a consistent set of all three. The result is a fully-checkpointed single file that needs **no `-wal` or `-shm` beside it**.
+
+The snapshot is verified (`integrity_check`) immediately, so a bad backup surfaces while you are watching rather than during a restore, when you are not. It refuses to overwrite an existing file.
+
+## `restore`
+
+```bash
+posthorn restore --from /backups/posthorn-2026-09-08.db --config /etc/posthorn/config.toml --yes
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--from <file>` | — | Backup to restore (required) |
+| `--to <db>` | the configured `storage.path` | Target database path |
+| `--config <path>` | `/etc/posthorn/config.toml` | Used to find the target when `--to` is absent |
+| `--yes` | off | Proceed without the confirmation stop |
+
+**Stop Posthorn first.** Restore refuses to run when the target looks in use: replacing the file under a running process leaves it writing through a descriptor to a database nobody can see, and the corruption is silent and total.
+
+The existing database is **renamed aside**, not deleted — `posthorn.db.superseded-<timestamp>`. A restore is performed by someone having a bad day, and that rename is the difference between a mistake and a disaster. Stale `-wal`/`-shm` files are cleared (they belong to the superseded database and would corrupt the restored one), and the result is verified before the command reports success.
+
+## `version`
+
+```bash
+$ posthorn version
+posthorn v1.0.0
+```
+
+Aliased to `--version` and `-v`. The output is `posthorn <version>` on a single line — the version string is injected at build time via `-ldflags "-X main.version=v1.0.0"`. Local development builds print `posthorn v0.0.1-dev`.
+
+## `help`
+
+```bash
+$ posthorn help
+posthorn — outbound mail gateway
+
+Usage:
+  posthorn serve     [--config <path>] [--listen <addr>]
+  posthorn validate  [--config <path>]
+  posthorn version
+  posthorn help
+
+Examples:
+  posthorn serve --config /etc/posthorn/config.toml
+  posthorn validate --config ./posthorn.toml
+```
+
+Aliased to `--help` and `-h`. Subcommand-specific help is not separately wired — the top-level `help` lists the flag set for each subcommand.
+
+## Environment variables
+
+`posthorn` reads **one** env var of its own, and otherwise only the ones referenced from the TOML config via `${env.VAR}` placeholders.
+
+### `POSTHORN_ADMIN_TOKEN`
+
+Enables the [admin surface](/deployment/admin/). Unset means the routes are not mounted at all — "no token configured" never degrades into "no authentication required".
+
+It is read from the environment **only**: config cannot set it, so it does not end up in the file you paste into an issue. It must be at least 24 characters, and startup **refuses** if it collides with any project API key or SMTP password — sharing one would mean a tenant's application key could read every tenant's delivery history.
+
+Notably:
+
+- There's no `POSTHORN_CONFIG` to override `--config`. Use the flag.
+- There's no `POSTHORN_LISTEN` to override `--listen`. Use the flag.
+- There's no `POSTHORN_LOG_LEVEL`. Use the `[logging]` section in the TOML.
+
+This is intentional — there's one source of truth for config (the TOML), and one mechanism for secrets (`${env.VAR}` substitution). `POSTHORN_ADMIN_TOKEN` is the deliberate exception, and it is an exception precisely so that credential cannot live in the config file.
+
+One consequence of `${env.VAR}` substitution worth knowing: placeholders are resolved **before** the TOML is parsed, so a placeholder inside a comment still has to resolve. Comment out the variable too, or drop the line.

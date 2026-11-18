@@ -1,0 +1,137 @@
+---
+title: Metrics
+description: Every metric Posthorn exposes on /metrics, its labels, and the cardinality policy behind them.
+---
+
+Posthorn exposes Prometheus metrics at `/metrics` in the 0.0.4 text
+exposition format. The endpoint is auth-free and rate-limit-free —
+firewall it at the reverse proxy if internal-only access matters.
+
+## The cardinality policy
+
+Prometheus cardinality is a memory bill that arrives later. One label
+carrying a message id turns a single time series into one per message,
+and those series do not go away.
+
+So Posthorn's label space is **closed**. Every label value is one of:
+
+- an operator-configured name — an endpoint path, a provider name, a
+  router name, a project name;
+- a value from a fixed enum — a status, an error class, a circuit
+  state, a delivery event type, a quota window.
+
+Nothing request-scoped is ever a label. Specifically **never**: message
+ids, recipient addresses, sender addresses, subjects, message bodies,
+provider error strings, idempotency keys, client IPs, or URLs.
+
+This is structural rather than a rule to remember: the `metrics.Recorder`
+API does not accept request-side values, so there is no parameter for
+one to travel through. `metrics/cardinality_test.go` audits it by
+calling every exported Recorder method with a sentinel and asserting the
+emitted label vocabulary is exactly the list below.
+
+If you need per-message detail, that is what the submission log and the
+[scoped query API](/reference/http-api/) are for. A time series is the
+wrong shape for it.
+
+## Submission metrics
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `posthorn_submissions_received_total` | counter | `endpoint` |
+| `posthorn_submissions_sent_total` | counter | `endpoint`, `transport` |
+| `posthorn_submissions_failed_total` | counter | `endpoint`, `transport`, `error_class` |
+| `posthorn_submissions_queued_total` | counter | `endpoint`, `transport` |
+| `posthorn_send_latency_seconds` | histogram | `endpoint` |
+| `posthorn_validation_failed_total` | counter | `endpoint` |
+| `posthorn_rate_limited_total` | counter | `endpoint` |
+| `posthorn_auth_failed_total` | counter | `endpoint` |
+| `posthorn_idempotent_replay_total` | counter | `endpoint` |
+| `posthorn_spam_blocked_total` | counter | `endpoint`, `kind` |
+| `posthorn_check_failed_open_total` | counter | `endpoint`, `check` |
+| `posthorn_suppressed_recipients_total` | counter | `endpoint` |
+
+## Storage and queue
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `posthorn_storage_healthy` | gauge | — |
+| `posthorn_retry_queue_depth` | gauge | — |
+| `posthorn_queue_sent_total` | counter | `endpoint` |
+| `posthorn_queue_retries_total` | counter | `endpoint` |
+| `posthorn_queue_dead_lettered_total` | counter | `endpoint` |
+
+`posthorn_storage_healthy` is the canary, not a liveness signal: a
+degraded disk does not stop mail flow, and `/healthz` stays 200. Alert on
+this gauge; see also `/readyz`, which does go unready on a degraded disk
+because a restart will not fix one.
+
+## Provider and routing
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `posthorn_provider_attempts_total` | counter | `provider`, `outcome` |
+| `posthorn_provider_latency_seconds` | histogram | `provider` |
+| `posthorn_provider_skipped_total` | counter | `provider` |
+| `posthorn_provider_circuit_state` | gauge | `provider` |
+| `posthorn_provider_cost_per_1000_micros` | gauge | `provider` |
+| `posthorn_route_failover_total` | counter | `router` |
+| `posthorn_route_exhausted_total` | counter | `router` |
+| `posthorn_route_quota_exhausted_total` | counter | `router` |
+
+`posthorn_provider_circuit_state` is `0` closed, `1` half-open, `2` open.
+**This is the metric to alert on for a provider outage** — not `/readyz`,
+which deliberately stays ready when an upstream is down, because the
+retry queue and failover exist to absorb exactly that.
+
+## Quota
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `posthorn_provider_quota_limit` | gauge | `provider`, `window` |
+| `posthorn_provider_quota_remaining` | gauge | `provider`, `window` |
+| `posthorn_provider_quota_exhausted_total` | counter | `provider`, `window` |
+| `posthorn_project_quota_limit` | gauge | `project`, `window` |
+| `posthorn_project_quota_remaining` | gauge | `project`, `window` |
+| `posthorn_project_quota_exhausted_total` | counter | `project`, `window` |
+
+`window` is `day` or `month`. Windows are UTC — a provider's own window
+is in *its* timezone and no two agree, so any local choice would be
+wrong for some provider while looking authoritative. Leave headroom for
+the offset when sizing a limit.
+
+## Projects
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `posthorn_project_send_total` | counter | `project`, `status` |
+| `posthorn_project_send_duration_seconds` | histogram | `project` |
+| `posthorn_project_provider_total` | counter | `project`, `provider` |
+| `posthorn_project_delivery_total` | counter | `project`, `event` |
+
+`event` is a unified delivery event type (`message.delivered`,
+`message.bounced`, …), never a provider's own vocabulary.
+
+## Lifecycle events
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `posthorn_lifecycle_events_total` | counter | `kind` |
+| `posthorn_lifecycle_dropped_total` | counter | `reason` |
+| `posthorn_lifecycle_forwards_total` | counter | `endpoint`, `outcome` |
+| `posthorn_provider_webhook_total` | counter | `provider`, `result` |
+
+`posthorn_provider_webhook_total{result="rejected"}` rising is a webhook
+that failed verification — either a misconfiguration or someone posting
+forged events at you. It is worth an alert.
+
+## Label vocabulary
+
+The complete set of label names v1.0 emits:
+
+`endpoint`, `transport`, `provider`, `router`, `project`, `window`,
+`status`, `outcome`, `result`, `reason`, `kind`, `check`, `error_class`,
+`state`, `event`, `type`, and `le` (histogram bucket bounds).
+
+Adding a name to this list is a deliberate cardinality decision. The
+audit test fails until it is made explicitly.

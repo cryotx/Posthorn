@@ -1,0 +1,183 @@
+---
+title: Routing & failover
+description: Pick which provider takes each message — ordered failover, weighted splits, and rules that match on recipient domain or submitted fields.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Once an endpoint names more than one [pool provider](/configuration/providers/), something has to decide which one gets each message. That decision has two layers:
+
+1. **Rules** pick a *route* — a list of providers — by matching the message.
+2. **A strategy** picks which provider in that route gets the first attempt.
+
+Anything that fails is followed by the rest of the route, in order.
+
+## Strategies
+
+```toml
+[endpoints.transport]
+strategy  = "failover"     # failover (default) | round_robin | weighted
+providers = ["postmark-prod", "ses-backup"]
+```
+
+| Strategy | First attempt goes to | Use it when |
+|---|---|---|
+| `failover` | always the first provider in the list | You have a primary and a backup, and you mean it. |
+| `round_robin` | each provider in turn, evenly | You want to spread load and don't care how. |
+| `weighted` | providers in proportion to `weight` | You're shifting traffic gradually, or one provider is cheaper. |
+| `free_first` | every zero-cost provider, then the paid ones | You live on a free tier with a paid account behind it. |
+| `cheapest` | the lowest `cost_per_1000` first | You want the bill minimised and don't care which provider. |
+
+`free_first` and `cheapest` need prices — see [Quota & cost routing](/features/quota-and-cost/).
+
+`weighted` uses smooth weighted round-robin, so a 3:1 split really is 30/10 over 40 messages — not 30/10 on average. That makes both your dashboards and your provider bills predictable.
+
+Whatever the strategy, **failover order after the first pick is always the declared order.** A strategy decides where a message starts, never whether it may move on.
+
+## What fails over — and what doesn't
+
+Only **health-class** failures advance to the next provider:
+
+| Class | Meaning | Fails over? |
+|---|---|---|
+| transient | network error, upstream 5xx | ✅ |
+| rate-limited | 429 | ✅ |
+| terminal | 4xx other than 429 | ❌ stops there |
+| quota exhausted | the provider's budget is spent | n/a — it is skipped before being called |
+
+A terminal error is the provider telling you *this message* is unacceptable — an unverified `From` domain, a malformed address, a payload over the cap. Offering the same rejected message to every remaining provider would turn one rejection into N rejections charged against N sender reputations. So Posthorn stops, and the error names the provider that rejected it:
+
+```
+transport: message rejected (class=terminal provider=postmark-prod status=422)
+```
+
+<Aside type="tip">
+Failover composes with the ordinary [retry policy](/features/retry-policy/). The retry policy wraps the whole route, so a pool that exhausts every provider on transient errors gets one more full pass after the backoff — all still inside the request's 10-second hard timeout.
+</Aside>
+
+### When everything is out of budget
+
+A provider whose [send quota](/features/quota-and-cost/) is spent is skipped before it is ever called, and that skip is **not** a health event — it never touches the circuit breaker. If every provider in a route is out of budget, the send fails with its own `quota_exhausted` class, and with storage configured the message is queued until the window rolls over rather than dropped.
+
+### When everything is down
+
+If every provider in the route has an open circuit, or all of them fail transiently, the send returns a **transient** error — never a terminal one. With [storage](/features/storage/) configured, the retry queue holds the message and drains it when a provider recovers. Without storage, the caller gets a 502 and the failure is logged, exactly as a single-provider outage always behaved.
+
+## Routing rules
+
+Rules send some messages down a different route. They live in the same transport block, are evaluated **in declared order**, and the **first match wins**. Anything matching no rule takes the block's top-level `providers` list.
+
+```toml
+[endpoints.transport]
+strategy  = "weighted"
+providers = ["postmark-prod", "ses-backup"]   # the default route
+
+# Bulk-ish destinations go to the cheap high-volume upstream.
+[[endpoints.transport.rules]]
+match_recipient_domain = ["example.net", "*.example.org"]
+strategy               = "failover"
+providers              = ["mailgun-bulk", "ses-backup"]
+
+# Paying customers get the deliverability-first upstream.
+[[endpoints.transport.rules]]
+providers = ["postmark-prod"]
+[endpoints.transport.rules.match_field]
+plan = ["enterprise", "pro"]
+```
+
+A rule needs at least one match criterion and at least one provider (or a [group](/features/quota-and-cost/#provider-groups)). When both criteria are present they **AND** together; values within one criterion **OR**.
+
+### `match_recipient_domain`
+
+Patterns are exact (`example.net`) or a leading-label wildcard (`*.example.org`, which covers `campus.example.org` and `cs.example.org`). Comparison is case-insensitive; patterns must be written lowercase.
+
+**Every recipient must match** for the rule to fire. A message to `alice@example.net` and `bob@example.com` falls through to the default route rather than matching the domain rule.
+
+That is deliberate. "Any recipient matches" would let a single matching address drag a whole multi-recipient message onto the bulk provider. Splitting the message per-domain would be fan-out — two provider message IDs for one submission, which breaks the [submission log's](/features/storage/) one-row-one-send shape — and is out of scope.
+
+### `match_kind`
+
+Matches the message's [mail kind](/features/quota-and-cost/#mail-kinds) — the criterion that expresses "verification goes to the fast provider, notifications go to the free pool":
+
+```toml
+[[endpoints.transport.rules]]
+match_kind = ["verification", "password_reset"]
+providers  = ["postmark-fast"]
+```
+
+### `match_field`
+
+Matches operator-named submitted fields against operator-listed values:
+
+```toml
+[[endpoints.transport.rules]]
+providers = ["postmark-prod"]
+[endpoints.transport.rules.match_field]
+plan   = ["enterprise", "pro"]
+region = ["eu"]
+```
+
+That rule fires when the submission carries `plan` of `enterprise` **or** `pro`, **and** `region` of `eu`.
+
+<Aside type="note">
+Submitter data selects among routes **you** wrote; it can never name a provider. A caller sending `plan=../../admin` matches no listed value and falls through to the default route. The reachable set of providers is exactly what your config sanctions.
+</Aside>
+
+Fields come from the HTTP ingresses. The SMTP listener leaves them empty, so a `match_field` rule never fires on SMTP traffic — use `match_recipient_domain` there.
+
+## Checking your rules before you trust them
+
+Rules are the one part of the config whose effect you cannot read off the TOML. Set `dry_run = true` and the 200 response tells you where a message would have gone:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/transactional \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  --data '{"to_override":"prof@cs.example.org","subject_line":"x","message":"y"}'
+```
+
+```json
+{
+  "status": "dry_run",
+  "submission_id": "4bafba51-…",
+  "prepared_message": { "to": ["prof@cs.example.org"], "subject": "x", "body_text": "y" },
+  "route": {
+    "matched_rule": 0,
+    "strategy": "round_robin",
+    "providers": ["mailgun-bulk", "ses-backup"]
+  }
+}
+```
+
+`matched_rule` is the index of the rule that fired, or `-1` for the default route. `providers` is the route's list in **declared** order — computing the actual attempt order would advance the round-robin rotation, and a debugging request should never move production traffic.
+
+## Watching routing in production
+
+```
+posthorn_route_failover_total{router="/api/contact"}    # delivered by a non-first provider
+posthorn_route_exhausted_total{router="/api/contact"}   # nobody could take it
+posthorn_provider_attempts_total{provider,outcome}      # outcome: sent|transient|rate_limited|terminal
+posthorn_provider_skipped_total{provider}               # passed over on an open circuit
+posthorn_provider_quota_exhausted_total{provider,window} # passed over on a spent budget
+posthorn_route_quota_exhausted_total{router}            # nobody had budget
+```
+
+`posthorn_submissions_sent_total` is labelled with the provider that actually delivered, and `submission_sent` log lines carry a `provider` field:
+
+```json
+{"msg":"submission_sent","endpoint":"/api/contact","transport":"pool",
+ "provider":"ses-backup","transport_message_id":"…","latency_ms":2}
+```
+
+With [storage](/features/storage/) enabled, the submission log's transport column is updated to the delivering provider too — so "which provider sent this?" is answerable months later.
+
+## The SMTP listener
+
+`[smtp_listener.transport]` takes the same block, so the SMTP path gets the same failover and splits:
+
+```toml
+[smtp_listener.transport]
+strategy  = "failover"
+providers = ["postmark-prod", "ses-backup"]
+```
+
+Each accepted message still goes to exactly one provider. Per-*tenant* SMTP routing — different senders resolving to different identities, DKIM keys and suppression scopes — remains out of scope.

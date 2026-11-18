@@ -1,0 +1,135 @@
+---
+title: Production operations
+description: Delivery semantics, backup and restore, storage durability, crash behaviour, and the capacity envelope of a single Posthorn instance.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+What an operator needs to know before pointing real traffic at Posthorn: what it actually promises about delivery, how to back it up, and where it stops behaving well.
+
+## Delivery semantics: at-least-once
+
+**Posthorn delivers at least once. It is not exactly-once, and no configuration makes it so.**
+
+<Aside type="caution">
+A provider can accept your message and have its HTTP response lost on the way back. Posthorn then sees a timeout, correctly classifies it as transient — it genuinely cannot tell "never arrived" from "arrived, reply lost" — and fails over or retries. The mail goes twice.
+</Aside>
+
+This is structural and lives outside Posthorn. It was reproduced directly during release testing: a provider accepted a message while Posthorn was killed, recovery moved the submission into the retry queue, and the retry sent it again.
+
+What each mechanism actually covers:
+
+| Mechanism | Deduplicates | Does **not** cover |
+|---|---|---|
+| `Idempotency-Key` | your own retries of one request, including concurrent ones | what a provider did with a request that timed out |
+| Retry + failover | — | deliberately prefers a possible duplicate to a possible loss |
+| Retry queue / crash recovery | — | at-least-once by construction; the crash window *is* the ambiguous case |
+
+### What to do about it
+
+For verification codes and password resets, **keep the same business token across retries of one logical message.**
+
+```python
+# Generate the code ONCE, keyed to the attempt.
+code = get_or_create_verification_code(user_id, attempt_id)
+send(to=user.email, code=code, idempotency_key=f"verify:{user_id}:{attempt_id}")
+```
+
+Then a duplicate delivery is two copies of one working code rather than two competing codes, and the ambiguity is invisible to the user. Regenerating the code on every retry is what turns a harmless duplicate into a broken login.
+
+The alternative — distributed transactions, or provider-side dedup APIs — is out of scope for a single-binary gateway. The honest fix is this caller-side convention, not machinery.
+
+## Storage durability
+
+SQLite is opened with:
+
+| Pragma | Value | Why |
+|---|---|---|
+| `journal_mode` | `WAL` | readers never block the writer; a crash replays the log rather than losing the transaction |
+| `synchronous` | `FULL` | every commit reaches the disk before it is acknowledged. Slower than `NORMAL`, and correct: a commit Posthorn reported must survive power loss |
+| `busy_timeout` | `5000` ms | a writer waits rather than failing instantly under a burst. Measured at 1000-way concurrency with zero busy errors |
+| `foreign_keys` | `ON` | queue rows cannot outlive the submission they point at |
+| `max_page_count` | from `max_size` | Posthorn cannot fill its own disk |
+
+### When the disk fails
+
+Storage failure degrades; it never blocks mail. Verified against a full filesystem:
+
+- The failing write logs `storage_degraded` once, naming the real error.
+- `/healthz` reports `"storage":"degraded"` and `posthorn_storage_healthy` drops to 0 **immediately**, not at the next canary probe.
+- `idempotency_unguarded` is logged on every request whose reservation could not be taken — the operator is told plainly that a concurrent retry could now send twice.
+- Sends continue. Project quota keeps enforcing from its in-memory counter.
+- On startup, a database that cannot be created at all is a **hard failure**: Posthorn refuses to start rather than running without the storage it was configured for.
+
+## Backup and restore
+
+SQLite's online backup API takes a consistent snapshot with the gateway **running** — no downtime, no host maintenance window.
+
+```bash
+# Back up a live Posthorn. Safe to run from cron.
+sqlite3 /var/lib/posthorn/posthorn.db ".backup '/backups/posthorn-$(date +%F-%H%M).db'"
+
+# Verify the backup before trusting it.
+sqlite3 /backups/posthorn-2026-09-08-0900.db "PRAGMA integrity_check;"
+```
+
+For the Compose deployment:
+
+```bash
+docker compose exec posthorn /usr/local/bin/posthorn version   # confirm the container is up
+sqlite3 ./data/posthorn.db ".backup './backups/posthorn-$(date +%F).db'"
+```
+
+<Aside type="note">
+Do **not** back up by copying the `.db` file with `cp` while Posthorn is running — that races the WAL and can produce a file that passes `integrity_check` while missing recent commits. Use `.backup`, which is the online-backup API.
+</Aside>
+
+**Restore** is a file copy into place with the gateway stopped:
+
+```bash
+docker compose stop posthorn
+cp /backups/posthorn-2026-09-08.db ./data/posthorn.db
+rm -f ./data/posthorn.db-wal ./data/posthorn.db-shm   # stale WAL from the old file
+docker compose start posthorn
+```
+
+Release testing verified a quiesced backup and restore reproduces every table byte-for-byte — submissions, idempotency, retry queue, attempts, delivery events, recipient states, project and provider usage, suppressions — with the schema version intact.
+
+## Crash behaviour
+
+Posthorn is killed with `kill -9`. On restart:
+
+| State | What happens |
+|---|---|
+| Submissions left `sending` | recovered into the retry queue and retried — this is where a duplicate can occur (see above) |
+| Idempotency reservations left `pending` | settled with the `202 queued` answer, so the caller's retry replays instead of getting `409` for two minutes |
+| Project quota reservations | in-memory only; an uncommitted reservation simply evaporates, so no allowance leaks |
+| Project usage counters | written through immediately for projects **with a limit**, so a crash cannot refund spent budget |
+| Attempts / events | already committed; nothing is reconstructed |
+
+A reservation whose request died before its submission was persisted stays pending until its two-minute window expires, then the key is reusable. That is correct: there is no queued message to promise the caller.
+
+## Capacity
+
+Measured on a single instance with SQLite and a local provider. These are boundaries to plan against, not a benchmark:
+
+| Concurrency | p50 | p95 | p99 | Outcome |
+|---|---|---|---|---|
+| 100 | 35 ms | 78 ms | 83 ms | all 200 |
+| 500 | 36 ms | 69 ms | **1.04 s** | all 200 |
+| 1000 | 41 ms | 76 ms | **1.05 s** | all 200 |
+
+**The p99 crosses one second somewhere between 100 and 500 concurrent requests.** Median and p95 stay flat well past that, so the tail is where a burst shows up first — size alerting on p99, not on the median.
+
+Across 1600 concurrent sends: zero SQLite-busy errors, zero dropped requests, 14 OS threads, 31 MB RSS. No goroutine or memory growth.
+
+Correctness holds at the top of that range:
+
+- 1000 concurrent requests against a `daily_limit = 250` project produced **exactly** 250 sends and 750 `429`s.
+- 1000 concurrent requests sharing one `Idempotency-Key` produced **exactly one** message and one unit of quota.
+
+## Single instance, single writer
+
+Posthorn is a single-instance design. Two processes sharing one SQLite file is unsupported, and the guarantees that would break are specific: quota strictness is per process, idempotency reservations are per database, and the retry worker assumes it is the only one draining the queue.
+
+Scale by giving each Posthorn its own database and its own projects, not by pointing two at one file.

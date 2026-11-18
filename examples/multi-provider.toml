@@ -1,0 +1,171 @@
+# Posthorn — multi-provider gateway example
+#
+# Everything below is optional on top of a v1.x config: an endpoint that
+# keeps the inline `type` + `settings` transport block behaves exactly as
+# it did before. This file shows the pooled shape.
+#
+# Validate it with:
+#   posthorn validate --config examples/multi-provider.toml
+
+# ---------------------------------------------------------------------
+# The provider pool
+#
+# Each [[providers]] block is one credential set for one upstream.
+# Endpoints and the SMTP listener reference entries BY NAME, so a key
+# appears once no matter how many endpoints send through it.
+#
+# A pool entry is built once per process. Two endpoints naming
+# "postmark-prod" share one HTTP client and one circuit breaker — health
+# is a property of the provider, not of the endpoint that noticed.
+# ---------------------------------------------------------------------
+
+[[providers]]
+name = "postmark-prod"
+type = "postmark"
+weight = 3                              # only used by strategy = "weighted"
+[providers.settings]
+api_key = "${env.POSTMARK_API_KEY}"
+
+[[providers]]
+name = "ses-backup"
+type = "ses"
+weight = 1
+[providers.settings]
+region            = "us-east-1"
+access_key_id     = "${env.AWS_ACCESS_KEY_ID}"
+secret_access_key = "${env.AWS_SECRET_ACCESS_KEY}"
+
+# Per-provider circuit breaker. Omit the block for the defaults:
+# 5 consecutive health-class failures open the circuit, 30s cooldown,
+# 1 half-open probe. Only transient / rate-limited failures count —
+# a terminal 4xx describes the message, not the provider, so it never
+# takes a healthy upstream out of rotation.
+[providers.circuit_breaker]
+failure_threshold = 5
+cooldown          = "30s"
+half_open_probes  = 1
+
+[[providers]]
+name = "mailgun-bulk"
+type = "mailgun"
+[providers.settings]
+api_key = "${env.MAILGUN_API_KEY}"
+domain  = "mg.example.com"
+region  = "us"
+
+# ---------------------------------------------------------------------
+# A contact form: ordered failover
+#
+# strategy = "failover" always starts at the first provider and walks
+# down the list. A transient error or a 429 moves to the next; a
+# terminal rejection stops there, because offering the same rejected
+# message to every provider in the pool just spends N reputations on one
+# bad submission.
+# ---------------------------------------------------------------------
+
+[[endpoints]]
+path             = "/api/contact"
+to               = ["you@example.com"]
+from             = "Contact Form <noreply@example.com>"
+honeypot         = "_gotcha"
+allowed_origins  = ["https://example.com"]
+required         = ["name", "email", "message"]
+subject          = "Contact from {{.name}}"
+body             = """
+From: {{.name}} <{{.email}}>
+
+{{.message}}
+"""
+redirect_success = "/thank-you"
+
+[endpoints.transport]
+strategy  = "failover"
+providers = ["postmark-prod", "ses-backup"]
+
+[endpoints.rate_limit]
+count    = 5
+interval = "1m"
+
+# ---------------------------------------------------------------------
+# A transactional API endpoint: weighted split plus routing rules
+#
+# Rules are evaluated in declared order and the first match wins;
+# anything matching no rule takes the top-level `providers` list. Two
+# criteria are available and they AND together when both are present:
+#
+#   match_recipient_domain — patterns against EVERY recipient's domain,
+#                            exact ("gmail.com") or suffix wildcard
+#                            ("*.edu"). All recipients must match, so a
+#                            message is never split across providers.
+#   match_field            — operator-named submitted fields against
+#                            operator-listed values. Submitter data
+#                            picks between routes you wrote; it can
+#                            never name a provider.
+#
+# `posthorn` will tell you where a message would go without sending it:
+# set dry_run = true and the 200 response carries a "route" block naming
+# the matched rule and its providers.
+# ---------------------------------------------------------------------
+
+[[endpoints]]
+path     = "/api/transactional"
+to       = ["fallback@example.com"]
+from     = "YourApp <noreply@example.com>"
+auth     = "api-key"
+api_keys = ["${env.WORKER_KEY_PRIMARY}"]
+required = ["subject_line", "message"]
+subject  = "{{.subject_line}}"
+body     = "{{.message}}"
+
+[endpoints.transport]
+strategy  = "weighted"
+providers = ["postmark-prod", "ses-backup"]
+
+# Bulk-ish destinations go to the cheap high-volume upstream.
+[[endpoints.transport.rules]]
+match_recipient_domain = ["gmail.com", "*.edu"]
+strategy               = "failover"
+providers              = ["mailgun-bulk", "ses-backup"]
+
+# Paying customers get the deliverability-first upstream, no matter
+# which domain they are on.
+[[endpoints.transport.rules]]
+providers = ["postmark-prod"]
+[endpoints.transport.rules.match_field]
+plan = ["enterprise", "pro"]
+
+# ---------------------------------------------------------------------
+# The SMTP listener takes the same transport block (revised ADR-13:
+# one listener still hands each message to ONE Transport — that
+# Transport may now be a pool).
+# ---------------------------------------------------------------------
+
+[smtp_listener]
+listen          = ":2525"
+require_tls     = true
+tls_cert        = "/etc/posthorn/cert.pem"
+tls_key         = "/etc/posthorn/key.pem"
+auth_required   = "smtp-auth"
+allowed_senders = ["*@example.com"]
+
+[[smtp_listener.smtp_users]]
+username = "ghost"
+password = "${env.GHOST_SMTP_PASSWORD}"
+
+[smtp_listener.transport]
+strategy  = "failover"
+providers = ["postmark-prod", "ses-backup"]
+
+# ---------------------------------------------------------------------
+# Storage is optional but pairs well with a pool: when every provider in
+# a route is unavailable the router returns a transient error, and the
+# retry queue holds the message instead of dropping it.
+# ---------------------------------------------------------------------
+
+[storage]
+path      = "/var/lib/posthorn/posthorn.db"
+retention = "720h"
+
+[logging]
+level  = "info"
+format = "json"

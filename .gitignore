@@ -1,0 +1,49 @@
+# Modified for the cryotx/posthorn distribution.
+# Built binaries — root-anchored paths so we don't accidentally match
+# directories named "posthorn" (e.g., core/cmd/posthorn/ source dir).
+/posthorn
+/posthorn.bin
+/core/posthorn
+/bin/
+
+# Test artifacts
+*.test
+coverage.out
+
+# Local config files (operators write their own)
+*.toml.local
+config.local.toml
+
+# Credentials, anywhere. Broad on purpose: a secret committed once is
+# committed forever, and the cost of an over-eager ignore rule is that
+# someone has to `git add -f` a file they meant to share.
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+*.pem
+*.key
+credentials.toml
+*.local.toml
+/deploy/compose/data/
+/deploy/compose/data.backup*/
+/deploy/compose/INTEGRATION.md
+/deploy/compose/provider-setup-status.json
+*.env
+*.env.*
+!*.env.example
+*.bak
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db.bak*
+*.log
+
+# Live databases and their WAL companions.
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
